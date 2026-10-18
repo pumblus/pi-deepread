@@ -13,7 +13,7 @@ DeepSeek handles standard searches at ¥0.005/call. Exa is an optional fallback 
 ## Installation
 
 ```bash
-# From npm (once published)
+# From npm (recommended)
 pi install npm:pi-deepread
 
 # Or install from a local clone

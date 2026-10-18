@@ -13,7 +13,7 @@
 ## 安装
 
 ```bash
-# 从 npm 安装（发布后推荐）
+# 从 npm 安装（推荐）
 pi install npm:pi-deepread
 
 # 或直接从本地目录安装

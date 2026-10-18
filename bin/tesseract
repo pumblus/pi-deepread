@@ -2,10 +2,35 @@
 # anymd spawns `tesseract <image> stdout` with no -l, so OCR was English-only
 # (Chinese scans came back as garbage Latin). This shim only adds a language when
 # the caller did not pass one. Override with ANYMD_TESS_LANGS.
-REAL=/opt/homebrew/bin/tesseract
+#
+# The real binary is looked up on PATH, skipping this shim's own directory (pi-deepread
+# prepends it), so the package works with Homebrew on either /opt/homebrew or
+# /usr/local, Linux distro packages, and custom installs. Pin it with TESSERACT_BIN.
+SELF="${BASH_SOURCE[0]}"
+HERE="$(cd "$(dirname "$SELF")" 2>/dev/null && pwd)"
+
+if [ -z "${TESSERACT_BIN:-}" ]; then
+  OLDIFS="$IFS"; IFS=:
+  for dir in $PATH; do
+    [ -n "$dir" ] || continue
+    candidate="$dir/tesseract"
+    [ -x "$candidate" ] || continue
+    [ "$candidate" -ef "$SELF" ] && continue
+    [ "$dir" = "$HERE" ] && continue
+    TESSERACT_BIN="$candidate"
+    break
+  done
+  IFS="$OLDIFS"
+fi
+
+if [ -z "${TESSERACT_BIN:-}" ]; then
+  echo "tesseract shim: no tesseract binary found on PATH (install it, or set TESSERACT_BIN)" >&2
+  exit 127
+fi
+
 for arg in "$@"; do
   case "$arg" in
-    -l|--oem|--psm) exec "$REAL" "$@" ;;
+    -l|--oem|--psm) exec "$TESSERACT_BIN" "$@" ;;
   esac
 done
-exec "$REAL" -l "${ANYMD_TESS_LANGS:-chi_sim+eng}" "$@"
+exec "$TESSERACT_BIN" -l "${ANYMD_TESS_LANGS:-chi_sim+eng}" "$@"

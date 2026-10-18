@@ -25,7 +25,8 @@
   "files": [
     "extensions/",
     "bin/",
-    "docs/",
+    "docs/BUILD_LOG.md",
+    "docs/BUILD_LOG_zh-CN.md",
     "README.md",
     "README_zh-CN.md",
     "LICENSE"
