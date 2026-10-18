@@ -1,0 +1,11 @@
+#!/bin/bash
+# anymd spawns `tesseract <image> stdout` with no -l, so OCR was English-only
+# (Chinese scans came back as garbage Latin). This shim only adds a language when
+# the caller did not pass one. Override with ANYMD_TESS_LANGS.
+REAL=/opt/homebrew/bin/tesseract
+for arg in "$@"; do
+  case "$arg" in
+    -l|--oem|--psm) exec "$REAL" "$@" ;;
+  esac
+done
+exec "$REAL" -l "${ANYMD_TESS_LANGS:-chi_sim+eng}" "$@"

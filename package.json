@@ -1,0 +1,44 @@
+{
+  "name": "pi-deepread",
+  "version": "0.1.0",
+  "description": "Full-text web search and document reading for Pi: DeepSeek need_content search, Exa fallback for 公众号/YouTube/V2EX, and local anymd conversion for PDF/Office/EPUB/images.",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-coding-agent",
+    "web-search",
+    "deepseek",
+    "exa",
+    "pdf",
+    "llm-tools"
+  ],
+  "license": "MIT",
+  "author": "Eric Zhou",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/pumblus/pi-deepread.git"
+  },
+  "homepage": "https://github.com/pumblus/pi-deepread#readme",
+  "bugs": {
+    "url": "https://github.com/pumblus/pi-deepread/issues"
+  },
+  "files": [
+    "extensions/",
+    "bin/",
+    "docs/",
+    "README.md",
+    "LICENSE"
+  ],
+  "pi": {
+    "extensions": [
+      "./extensions/web-access.ts"
+    ]
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*"
+  }
+}
