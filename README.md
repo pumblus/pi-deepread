@@ -11,9 +11,12 @@ Exa is optional, and only used where DeepSeek's index is weak (公众号 / 小�
 ## Install
 
 ```bash
-pi install npm:pi-deepread          # persistent
-pi -e npm:pi-deepread               # try it for one run
+pi install npm:pi-deepread          # from npm (once published)
+pi install /path/to/pi-deepread     # from a checkout
+pi -e /path/to/pi-deepread          # try it for one run, no install
 ```
+
+> Not on npm yet — install from the checkout until the first release is published.
 
 Remove `pi-web-access` first if you have it: both register `web_search` / `fetch_content` / `get_search_content`, and they will collide.
 
