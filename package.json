@@ -27,6 +27,7 @@
     "bin/",
     "docs/",
     "README.md",
+    "README_zh-CN.md",
     "LICENSE"
   ],
   "pi": {

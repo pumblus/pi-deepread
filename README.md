@@ -1,38 +1,47 @@
 # pi-deepread
 
-Lightweight web search and document reading for [Pi](https://pi.dev) — one small extension, three tools, no provider zoo.
+English | [简体中文](README_zh-CN.md)
 
-- **`web_search`** — DeepSeek `/v1/tools/search` with `need_content: true`, so every hit arrives with its **full extracted page text**, not a snippet.
-- **`fetch_content`** — DeepSeek `/v1/tools/fetch` for pages; **local** conversion (anymd → pdftotext) for PDF/Office/EPUB/images/audio. Nothing is uploaded.
-- **`get_search_content`** — every result is stored on disk with a `responseId`; page through it, or jump to passages with `findText`.
+Lightweight web search and document reading for [Pi](https://pi.dev). Single-file extension, three tools, no provider bloat.
 
-Exa is optional, and only used where DeepSeek's index is weak (公众号 / 小红书 / YouTube / V2EX / independent blogs), or when DeepSeek fails.
+- **`web_search`** — Uses DeepSeek `/v1/tools/search` with `need_content: true`. Every result includes the **full extracted page text**, not a short snippet.
+- **`fetch_content`** — Extracts web pages via DeepSeek `/v1/tools/fetch`, and converts local files (`.pdf`, `.docx`, `.xlsx`, `.epub`, images, audio) directly with `anymd` / `pdftotext`. Nothing is uploaded.
+- **`get_search_content`** — Stores results on disk with a `responseId`. Read through them with pagination or jump directly to passages using `findText`.
 
-## Install
+DeepSeek handles standard searches at ¥0.005/call. Exa is an optional fallback for DeepSeek's blind spots (WeChat articles, Xiaohongshu, V2EX, YouTube) or when queries fail.
 
-```bash
-pi install npm:pi-deepread          # from npm (once published)
-pi install /path/to/pi-deepread     # from a checkout
-pi -e /path/to/pi-deepread          # try it for one run, no install
-```
-
-> Not on npm yet — install from the checkout until the first release is published.
-
-Remove `pi-web-access` first if you have it: both register `web_search` / `fetch_content` / `get_search_content`, and they will collide.
+## Installation
 
 ```bash
-pi remove npm:pi-web-access
+# From npm (once published)
+pi install npm:pi-deepread
+
+# Or install from a local clone
+pi install /path/to/pi-deepread
+
+# Or test in a single session without installing
+pi -e /path/to/pi-deepread
 ```
+
+> **Note:** If you have `pi-web-access` installed, remove it first. Both register the same tool names (`web_search`, `fetch_content`, `get_search_content`) and will conflict:
+>
+> ```bash
+> pi remove npm:pi-web-access
+> ```
 
 ## Credentials
 
-Nothing to configure if Pi already has a DeepSeek key — `pi-deepread` reads it from Pi's `auth.json` at request time. Resolution order:
+If Pi already has a DeepSeek API key configured, you don't need to configure anything—`pi-deepread` reads it directly from Pi's `auth.json`.
+
+Key resolution order:
 
 1. `deepseekApiKey` in `<agent dir>/web-search.json`
-2. `DEEPSEEK_API_KEY` in the environment
-3. Pi's own `auth.json` → `deepseek`
+2. `DEEPSEEK_API_KEY` environment variable
+3. `deepseek` entry in Pi's `auth.json`
 
-Exa uses `exaApiKey` in the same JSON file, or `EXA_API_KEY`. It is entirely optional.
+Exa is optional and only used as a fallback. Set `exaApiKey` in the same config file or via the `EXA_API_KEY` environment variable.
+
+Example configuration (`~/.pi/agent/web-search.json`):
 
 ```json
 {
@@ -43,54 +52,70 @@ Exa uses `exaApiKey` in the same JSON file, or `EXA_API_KEY`. It is entirely opt
 }
 ```
 
-Key values may also be a command: `"deepseekApiKey": "!jq -r .deepseek.key ~/.pi/agent/auth.json"`.
+Keys also accept shell commands: `"deepseekApiKey": "!jq -r .deepseek.key ~/.pi/agent/auth.json"`.
 
-> **On a machine behind a TUN / fake-IP proxy** (Clash, Surge, sing-box), every hostname resolves into `198.18.0.0/15`. `pi-deepread` refuses private addresses to protect against SSRF, so ordinary sites look "internal". Add `ssrf.allowRanges: ["198.18.0.0/15"]` and it works again. Only do that if your proxy really owns that range.
+> **Using a TUN proxy (Clash, Surge, sing-box)?**
+> Fake-IP proxies map domain names into `198.18.0.0/15`. `pi-deepread` blocks private IP ranges by default to prevent SSRF. If your requests fail with blocked internal addresses, add `"ssrf": { "allowRanges": ["198.18.0.0/15"] }` to your config. Only enable this if your proxy uses that range.
 
-## Documents are parsed locally
+## Local Document Parsing
 
-| Input | Path |
+Local files are converted directly on your machine without uploading anything:
+
+| Format | Parser |
 |---|---|
-| `.pdf`, `.docx`, `.pptx`, `.xlsx`, `.epub`, `.csv`, … | [anymd](https://github.com/SylphxAI/anymd) → Markdown (headings, pipe tables, figure captions, OCR) |
-| PDF where anymd is unavailable | `pdftotext` |
-| images / audio / subtitles | anymd (OCR / transcript) |
-| anything else | DeepSeek fetch, then a plain HTTP reader |
+| `.pdf`, `.docx`, `.pptx`, `.xlsx`, `.epub`, `.csv` | [anymd](https://github.com/SylphxAI/anymd) → Markdown (headings, tables, captions, OCR) |
+| `.pdf` (when anymd is not installed) | `pdftotext` (plain text fallback) |
+| Images / Audio / Subtitles | anymd (OCR / transcripts) |
+| Web pages | DeepSeek `/v1/tools/fetch`, fallback to built-in HTTP reader |
+
+Install the optional local parsers:
 
 ```bash
-npm i -g @sylphx/anymd        # optional, strongly recommended
-brew install tesseract tesseract-lang   # only for OCR (Chinese needs the lang pack)
+# Optional, recommended: structured Markdown converter
+npm i -g @sylphx/anymd
+
+# Required only if you need OCR on images or scanned PDFs
+brew install tesseract tesseract-lang
 ```
 
-`bin/tesseract` ships with this package: anymd calls `tesseract <image> stdout` without `-l`, which made Chinese scans come out as garbage Latin. The shim adds `-l chi_sim+eng` (override with `ANYMD_TESS_LANGS`, or point `ANYMD_SHIM_DIR` at another shim directory).
+**Chinese OCR Shim:** anymd runs `tesseract <image> stdout` without language arguments, which turns Chinese scans into garbled Latin text. `pi-deepread` includes a shim in `bin/tesseract` that injects `-l chi_sim+eng` unless custom language flags are provided (customizable via `ANYMD_TESS_LANGS`).
 
-anymd's own URL mode is disabled on TUN-proxy machines too — `pi-deepread` always downloads to a temp file first (30 MB cap), so that limitation never applies.
+## Benchmarks
 
-## Measured, not claimed
+Measured on local hardware:
 
-| Operation | Result |
-|---|---|
-| `need_content: false` (old default) | 431-char summary, no body |
-| `need_content: true` | 3.7k–12.6k chars per hit, same ¥0.005/request |
-| query length | hard cap 128 chars — `HTTP 400 'query' must be at most 128 characters` |
-| fetch concurrency | 1–3 is clean; 10 threads → ~30% `HTTP 429` |
-| `fetch_content` with 4 URLs | 5.71 s serial → **2.85 s** at concurrency 3 |
-| `web_search` with 3 query variants | ~1.2 s serial → **0.45 s** |
-| arXiv PDF (15 pages) | anymd 41k chars with 26 headings + 146 table rows, 0.22 s; pdftotext 59k chars, 0 headings, 0.09 s |
+| Benchmark | Result | Notes |
+|---|---|---|
+| `need_content: false` (standard API) | ~431 chars | Short summary snippet only |
+| `need_content: true` (this extension) | 3.7k–12.6k chars | Full extracted page text for the same ¥0.005 |
+| Query length limit | 128 chars | DeepSeek hard limit (returns `HTTP 400` if exceeded) |
+| Fetch concurrency | 1–3 threads clean | 10 concurrent requests trigger ~30% `HTTP 429` |
+| `fetch_content` (4 URLs) | 5.71 s → **2.85 s** | Serial vs. concurrency of 3 |
+| `web_search` (3 query variants) | ~1.2 s → **0.45 s** | Concurrency optimization |
+| arXiv paper (15 pages) | anymd: 41k chars, 26 headings, 146 table rows (0.22 s) | `pdftotext`: 59k chars, 0 headings, broken columns (0.09 s) |
 
-## Limits worth knowing
+## Limits & Design Details
 
-- **128-char query cap** is enforced after `domainFilter` / `recencyFilter` are compiled into `site:` / `after:` operators. Over the cap, the query goes to Exa instead (when a key is set), or errors with the composed query in the message.
-- **Blind spots** — WeChat 公众号, 小红书, and much of V2EX are not in DeepSeek's index; YouTube results often land on `music.youtube.com`. With an Exa key those queries route to Exa automatically.
-- **Cache** — `<agent dir>/cache/web/` keeps 7 days / 200 files / 64 MB; prune runs hourly.
-- **`/web-status`** prints which keys resolved, the current timeouts, the OCR shim path, and cache usage.
+- **128-character query limit**: DeepSeek counts the final query string including `site:` and `after:` filter operators. Queries exceeding 128 characters are routed to Exa (if configured), or return an error displaying the full compiled query.
+- **Index blind spots**: WeChat Official Accounts (公众号), Xiaohongshu (小红书), and parts of V2EX are not indexed well by DeepSeek; YouTube links frequently resolve to `music.youtube.com`. With an Exa key configured, these queries route to Exa automatically.
+- **Local cache**: Search and fetch results are cached in `<agent dir>/cache/web/`. Automatically pruned every hour (retains up to 7 days, 200 files, or 64 MB).
+- **Status check**: Run `/web-status` inside Pi to inspect resolved API keys, active routing, timeouts, OCR shim detection, and cache size.
 
 ## Development
 
 ```bash
 git clone https://github.com/pumblus/pi-deepread
-pi -e ./pi-deepread          # load the checkout directly, no install
+pi -e ./pi-deepread          # run extension from local checkout
 ```
 
-The extension is a single file: [`extensions/web-access.ts`](extensions/web-access.ts). See [`docs/BUILD_LOG.md`](https://github.com/pumblus/pi-deepread/blob/main/docs/BUILD_LOG.md) (Chinese) for why every piece is the way it is — the debugging trail behind `need_content`, the 128-char limit, the 429 wall and the OCR shim.
+The extension lives in a single file: [`extensions/web-access.ts`](extensions/web-access.ts).
 
-MIT © Eric Zhou
+See [`docs/BUILD_LOG.md`](docs/BUILD_LOG.md) for the backstory, debugging notes, and engineering tradeoffs behind this project.
+
+## Credits & Inspiration
+
+This project was inspired by [@Arcadia_Bao](https://x.com/Arcadia_Bao/article/2111711040757006401)'s benchmark on using DeepSeek's search and fetch tools with `need_content: true`.
+
+## License
+
+[MIT](LICENSE) © Eric Zhou

@@ -1,225 +1,233 @@
-# 我是怎么把 pi-deepread 做出来的
+# How I Built pi-deepread: From a Single Tweet to a 1,300-Line Extension
 
-> 不是教程。这是一份踩坑记录：我想要的、我猜错的、最后为什么变成现在这样。
-> 代码大部分是 AI 写的，需求、取舍和验收是我的。所有数字都是本机实测。
+English | [简体中文](BUILD_LOG_zh-CN.md)
 
----
-
-## 0. 起点：我想要"能读全文"的搜索
-
-起因是看到忒修斯的船板那篇 [DeepSeek Search/Fetch 实测](https://x.com/Arcadia_Bao/article/2111711040757006401)。里面有一句让我立刻坐直的话：
-
-> 默认必须开 `need_content: true`，不加价，仍 0.005 元/次。
-
-意思是一次搜索请求，返回的不只是标题和摘要，还有每条的**整页正文**——文章里测到单条 4,100 到 18,000 字，arXiv 页面平均 28,717 字。
-
-我当时用的是 `pi-web-access`，它的做法是"搜索拿 snippet，需要正文再抓一次"。也就是两次请求、两次延迟。如果一次就能拿到正文，很多"搜完再抓"的动作可以直接省掉。
-
-于是就动手了。下面是真正花时间的部分。
+> This isn't a tutorial. It's a candid log of what I wanted to build, what I guessed wrong, and why the extension ended up the way it is. Most of the code was written with AI assistance; the requirements, debugging, tradeoffs, and verification were mine. All numbers are measured on my local machine.
 
 ---
 
-## 1. 第一个坑：我的机器把所有域名解析成内网地址
+## The Spark: Why Make Two Requests When Search Can Return Full Text?
 
-装上第一版、调用抓取，报错：
+It started with [@Arcadia_Bao's post](https://x.com/Arcadia_Bao/article/2111711040757006401) benchmarking DeepSeek's Search and Fetch APIs. One observation immediately stood out:
 
-```
+> You should always turn on `need_content: true`. There is no extra charge—it still costs ¥0.005 per query.
+
+That means a single search request returns not just titles and snippets, but the **full extracted page text** for every hit. In actual tests, that was 3.7k to 12.6k characters per result, and nearly 30,000 characters for an arXiv page.
+
+At the time, I was using `pi-web-access`. Its workflow followed the classic "search snippet, then fetch" pattern: search returns a few 800-character snippets, the model decides it doesn't have enough context, and it makes another tool call to fetch the page. Two network roundtrips, double the latency. If search could hand back the full page right away, most "search-then-fetch" roundtrips wouldn't need to happen at all.
+
+Existing extensions didn't enable that flag. So I decided to build one.
+
+---
+
+## Hitting a Wall on Day One: TUN Proxies and Fake-IP Collisions
+
+I wrote a quick prototype, ran a fetch test, and immediately got slapped with a red error:
+
+```text
 Error: Blocked internal address for x.com: 198.18.0.14.
 This address is in 198.18.0.0/15, commonly used by TUN/fake-IP proxies.
 ```
 
-我第一反应是"扩展的 SSRF 检查写错了"，因为 `x.com` 显然是公网。
+My first reaction was that my SSRF validation logic was broken. How on earth could `x.com` be an internal address?
 
-**其实是**：我机器上开着 TUN 模式的代理，所有域名都被映射成 `198.18.x.x` 的伪 IP（fake-IP），请求由代理按域名转发。而 `198.18.0.0/15` 是保留段，扩展的 SSRF 防护（防止恶意网页诱导 AI 去访问内网和云元数据接口）当然会拦。
+Then I checked my network setup. I run a TUN-mode proxy (Clash/Surge). To handle transparent routing, the proxy intercepts DNS queries and hands out fake IPs from the reserved `198.18.0.0/15` pool; actual traffic is routed by domain name under the hood. Meanwhile, the extension blocks reserved subnets to stop rogue web pages from tricking the agent into querying cloud metadata (like `169.254.169.254`) or local services. `198.18.0.0/15` was right in the blacklist.
 
-**改法**：配置里加
+The fix was straightforward—adding an opt-in config:
 
 ```json
-{ "ssrf": { "allowRanges": ["198.18.0.0/15"] } }
+{
+  "ssrf": {
+    "allowRanges": ["198.18.0.0/15"]
+  }
+}
 ```
 
-**这个取舍要说清楚**：等于告诉工具"这个网段是安全的"。在 TUN 代理下它确实全被代理接管，风险很低；但如果哪天你不在代理环境里，这个豁免就变成真的开口子。所以它是 opt-in，不是默认值。
+The tradeoff here is important: adding this line tells the tool "trust this subnet to be handled by the proxy." Behind a TUN proxy, that's safe. But if you move off that proxy, that exemption becomes an actual hole. That's why it is strictly opt-in and will never be a default setting.
 
 ---
 
-## 2. 第二个坑：想读的那篇文章本身读不到
+## Probing with curl: What the Docs Didn't Tell Me
 
-配置修好之后，`x.com` 返回 `HTTP 403`。换成 `r.jina.ai` 代理：
+After fixing the proxy config, I tried fetching the original tweet. `x.com` returned an `HTTP 403`. I tried routing it through `r.jina.ai`, and ran straight into Jina's domain block:
 
 ```json
 {"code":403,"name":"AbuseAlleviationError","message":"Anonymous access to domain x.com blocked until Sun Oct 18 2026..."}
 ```
 
-两条路都堵死。最后是让人把文章正文贴给我看的。
+In the end, I had to ask a friend to copy-paste the text for me.
 
-**教训**：抓取工具的失败模式分三类——网络层（超时/429）、站点层（403/登录墙）、平台层（Jina 这类第三方代理自己的封禁名单）。第三类最容易被误判成"我的配置有问题"，实际上跟你无关。
+That failure was a good reminder: fetching failures fall into three distinct tiers—network issues (timeouts, 429s), target site blocks (403s, paywalls, login walls), and third-party proxy blocks (Jina's own blacklists). It's easy to waste hours debugging local code when the problem is actually at the third tier.
 
----
+Before writing more extension code, I decided to test DeepSeek's raw API directly using curl. That turned out to be the best decision of the project:
 
-## 3. 第三个坑（最关键）：`need_content` 默认是关的
+### 1. `need_content` is off by default
 
-这是整件事的转折点。我先用 curl 直接打 API 验证，不开 `need_content`：
+Calling the raw search endpoint without `need_content`:
 
-```
+```text
 content_len = 0
 summary_len = 431
 ```
 
-只有一段 431 字的摘要。开了之后：
+You get a 431-character summary and zero page body. Once you pass `need_content: true`:
 
-```
+```text
 content_len = 3739 / 12614
 authority = 3, rerank_score ≈ 2.19
 ```
 
-**如果我没做这一步直接写代码，会得到"能跑但没用"的东西**：搜索正常返回、有标题有链接，看起来一切正常，只是永远拿不到正文，然后我会以为是 API 的问题去查文档。
+Each hit suddenly comes with thousands of characters of extracted text. If I had jumped straight into writing the extension without curling first, searches would have returned titles and URLs, everything would look like it worked, but the agent would receive only short summaries. I would have spent days wondering why DeepSeek wasn't returning full text.
 
-所以顺序很重要：**先用 curl 把 API 的真实行为摸清楚，再写扩展**。扩展只是把已验证的行为固定下来。
+DeepSeek also provides two native fields in the response: `authority` (0–4, ≥3 is authoritative) and `rerank_score` (0–3, ≥1.5 is high quality). They come directly from the API, so there is no need to compute ranking scores locally.
 
-顺带记两个好用的原生字段：`authority`（0–4，≥3 极权威）和 `rerank_score`（0–3，≥1.5 优质）——都是 DeepSeek 直接给的，不用自己算。
+### 2. The 128-character hard cap and query operators
 
----
+I initially thought it would be neat to compile `domainFilter` and `recencyFilter` into `site:` and `after:` operators inside the search `query`. It saved an extra parameter and felt clean. Then a slightly detailed query blew up:
 
-## 4. 第四个坑：query 硬限 128 字符，而且算子也算进去
-
-我把 `domainFilter` 和 `recencyFilter` 编译成 `site:` / `after:` 拼进 query，觉得很优雅——少一个参数、少一层歧义。然后 200 字符的 query 直接被打回：
-
-```
+```text
 HTTP 400 {"error":{"message":"'query' must be at most 128 characters (request_id: ...)"}}
 ```
 
-**改法**：拼完先量长度，超了就整条转给 Exa（它没有这个限制）；没有 Exa key 就报错，并把拼好的 query 原样打在错误信息里，让人一眼看到是哪里超的。
+DeepSeek measures the total character length of the final query string after operators are appended. Operators eat directly into that 128-character limit.
 
-这个设计后来救了我很多次——错误信息里带上下文，比"400 Bad Request"有用一百倍。
+The solution: measure the query length after compilation. If it exceeds 128 characters and an Exa key is configured, hand the entire query to Exa (which doesn't have this limit). If no Exa key is set, fail immediately, but include the compiled query string directly in the error message.
+
+Putting the full context into the error message saved me countless hours—you see right away what caused the query to spill over.
+
+### 3. Concurrency: 10 threads trigger 429s, 3 threads run clean
+
+My benchmarks showed that at 10 concurrent requests, roughly 30% of calls returned `HTTP 429` within 0.6 seconds.
+
+Even though 429 responses aren't billed, the backoff-and-retry penalty kills user responsiveness.
+
+My first version ran purely serially with a 900ms delay between requests. It was bulletproof, but fetching 4 URLs took nearly 6 seconds, mostly spent waiting on timers.
+
+The final setup uses **3 concurrency slots with a staggered launch delay of gap/3 (300ms)**:
+- At most 3 requests in flight at once (well below the rate-limit threshold).
+- New requests are staggered 300ms apart.
+
+Fetching 4 URLs dropped from 5.71 seconds to **2.85 seconds**, with zero 429s.
 
 ---
 
-## 5. 第五个坑：并发 10 会被限流，并发 3 不会
+## The Temptation: Why Not Just Patch Someone Else's Bundle?
 
-文章里的实测数据：10 线程并发时约 30% 的请求在 0.6 秒内返回 `HTTP 429`（不计费）；把并发压到 1–3、或者串行且间隔 0.8–1.0 秒，就完全正常。
+While inspecting `pi-web-access`, I found where DeepSeek search results were being sliced:
 
-我第一版是**纯串行 + 固定间隔 900ms**——绝对安全，但一批 5 个 URL 要 30 秒，其中大半时间在等间隔。
-
-这里有个反直觉的点：`429` 是**不计费**的，所以"多打几次、被限流就重试"在经济上不亏，但在延迟上很亏。最终方案是**3 个槽位 + 起始间隔 gap/3**：
-
-- 同时在飞的请求最多 3 个（不触发限流）
-- 新请求的发起时刻彼此间隔 300ms（900/3），批量场景下比串行快 3 倍
-
-实测 4 个 URL：串行估算 5.71 秒 → 实际 2.85 秒。
-
----
-
-## 6. 岔路：我一度想去改别人 dist 里的一个数字
-
-`pi-web-access` 的源码里，DeepSeek 结果被这一行截断：
-
-```js
+```javascript
 snippet: (text4(entry.summary) || text4(entry.snippet)).slice(0, MAX_SNIPPET_CHARS4)
 // MAX_SNIPPET_CHARS4 = 800
 ```
 
-请求体里也压根没发 `need_content`（`grep -c need_content dist/index.js` → 0）。上游 issue [#582](https://github.com/earendil-works/pi/issues/582) 开着、没人接。
+And `need_content` was nowhere in the request body (`grep -c need_content dist/index.js` returned 0). Upstream issue #582 was open with no activity.
 
-我试过打补丁：两个锚点在 bundle 里各命中一次，改完 `node --check` 也过了。但想想还是放弃了——
+I briefly considered patching the installed bundle: replace 800 with 8000. `node --check` passed, and it worked. But thinking it through made me stop:
 
-- 升级一次就白改
-- 1MB 的单文件 bundle 里塞私货，出问题没法定位
-- 我真正想要的不是"800 改成 8000"，而是"正文落盘、能分页、能按段落找"
+1. The next package update would wipe the patch immediately.
+2. Hacking a 1MB minified bundle is a maintenance nightmare whenever something breaks.
+3. More importantly, my goal wasn't just increasing a snippet cap from 800 to 8000. I wanted responses saved to disk, pagination, and a way to jump straight to passages with `findText`.
 
-**于是改成自己写一个**。1300 行、零运行时依赖、单文件。事后看这是整件事里最正确的决定。
+So I chose to write a fresh extension: 1,300 lines of TypeScript, a single file, and zero runtime dependencies. Looking back, that was the best call I made.
 
 ---
 
-## 7. 第七个坑：anymd 自己也有 SSRF 检查，而且不给你关
+## Local Document Parsing: anymd and the Second SSRF Trap
 
-文档类（PDF/Office/EPUB/图片）我用 [anymd](https://github.com/SylphxAI/anymd) 本地转 Markdown。它支持直接喂 URL，我本来想省掉下载那一步：
+Web pages can be fetched through DeepSeek, but what if a user asks to read a local PDF, DOCX, spreadsheet, EPUB, image, or audio recording? I didn't want sensitive local files sent to external APIs. Everything had to be converted locally.
 
-```
+I picked [anymd](https://github.com/SylphxAI/anymd). It converts a wide variety of formats into clean Markdown. It supports URLs directly, so I tried passing web URLs straight to it to avoid a separate download step:
+
+```text
 anymd: https://arxiv.org/pdf/1706.03762: URL host 'arxiv.org' resolves to a non-public address (SSRF protection).
 ```
 
-跟坑 1 是同一个根因：TUN 代理把 `arxiv.org` 解析成 `198.18.7.138`。区别在于 anymd 是编译好的 Rust 二进制，`strings` 里翻遍了也没有任何绕过开关。
+Same root cause: the TUN proxy resolved `arxiv.org` to `198.18.7.138`. But unlike my code, anymd is a precompiled Rust binary. Searching its strings showed no flags or environment variables to disable its SSRF checks.
 
-**改法**：永远先下载到本地临时文件（30MB 上限、流式落盘），再把文件路径喂给 anymd。既绕开了它的 SSRF，也顺手拿到了大小上限和临时文件清理。
+The fix: **always download to a local temporary file first, then pass the file path to anymd**. This bypasses anymd's SSRF checks, lets me enforce a 30MB file size cap, and ensures temp files get cleaned up automatically.
 
-**顺带一个坑中坑**：一开始我是 `arrayBuffer()` 全量读进内存再写盘，30MB 的文件 × 3 并发 = 90MB 峰值。改成流式之后，峰值只有几十 KB。
+There was a memory trap here, too: my first pass used `arrayBuffer()` to read 30MB into memory before writing to disk. With 3 concurrent downloads, memory spiked to 90MB. Switching to Node.js stream pipelines dropped peak memory down to tens of kilobytes.
 
 ---
 
-## 8. 第八个坑：中文扫描件全是乱码
+## Chinese Scanned PDFs: A 12-Line Shell Shim
 
-anymd 调 tesseract 的方式是 `tesseract <image> stdout`——**不带 `-l`**，默认只认英文。中文 PDF 扫出来是这样：
+Once files parsed properly, Chinese OCR broke. anymd invokes tesseract via `tesseract <image> stdout` without a `-l` flag, which defaults to English. Scanned Chinese documents came out as strings of nonsensical Latin characters.
 
-```
-_Image text is not extracted by default; pass `ocr: true` to OCR it (needs a local `tesseract`)._
-```
-
-（这是没开 OCR 的情况。开了 OCR、但没指定语言，出来的是拉丁字母乱码。）
-
-**改法**：写了个 12 行的 shell shim，塞在 PATH 前面：
+Instead of forking anymd and recompiling Rust, I wrote a 12-line shell shim and placed it ahead of system binaries in `PATH`:
 
 ```bash
+#!/bin/bash
+REAL=/opt/homebrew/bin/tesseract
 for arg in "$@"; do
-  case "$arg" in -l|--oem|--psm) exec /opt/homebrew/bin/tesseract "$@" ;; esac
+  case "$arg" in
+    -l|--oem|--psm) exec "$REAL" "$@" ;;
+  esac
 done
-exec /opt/homebrew/bin/tesseract -l "${ANYMD_TESS_LANGS:-chi_sim+eng}" "$@"
+exec "$REAL" -l "${ANYMD_TESS_LANGS:-chi_sim+eng}" "$@"
 ```
 
-调用方自己指定了语言就原样转发，没指定就补 `chi_sim+eng`。这个 shim 现在随包发布在 `bin/tesseract`，装上就有中文 OCR（前提是 `brew install tesseract-lang`）。
+If the caller specifies a language flag, the shim forwards the call untouched. If not, it injects `-l chi_sim+eng`. The shim ships in `bin/tesseract` with this package—install `tesseract-lang`, and Chinese OCR works out of the box.
 
 ---
 
-## 9. 本地解析到底值不值得：三个工具对比
+## Benchmarking: Is Structured Markdown Actually Worth It?
 
-为了确认 anymd 不是"看起来高级但更差"，我拿两篇论文做了对照实验（Attention Is All You Need，15 页；GPT-3，75 页）：
+To verify that anymd wasn't just unnecessary complexity, I ran benchmarks on two papers: the 15-page *Attention Is All You Need* and the 75-page *GPT-3* paper:
 
-| 工具 | 字符 | 标题 | 表格行 | 行尾连字符 | 坏字符 | 耗时 |
+| Tool | Chars Extracted | Headings | Table Rows | Hyphenation Errors | Bad Glyphs | Time |
 |---|---|---|---|---|---|---|
 | anymd | 41,026 | **26** | **146** | 0 | 0 | 0.22s |
 | pdftotext -layout | 59,444 | 0 | 0 | 16 | 15 | 0.09s |
-| pdftotext（raw） | 39,919 | 0 | 0 | 0 | 15 | 0.11s |
+| pdftotext (raw) | 39,919 | 0 | 0 | 0 | 15 | 0.11s |
 | mutool -F txt | 40,067 | 0 | 0 | 16 | 16 | 0.14s |
 
-结论不是"anymd 更好"，而是**它们的失败方式不同**：
+The results showed that **their failure modes are completely different**:
 
-- 传统工具输出的是"文本流"，双栏论文里两栏会交错——`ensembles, by over 2 BLEU` 后面紧跟另一栏的句子，短行占比 61%，模型读起来是碎的。
-- anymd 输出的是"文档结构"：`## 3 Model Architecture` → `### 3.1 Encoder and Decoder Stacks`，表格还原成 Markdown 管道表（`|Self-Attention|O(n^2 · d)|O(1)|O(1)|`），图注变成 `![Figure 1: ...](path.png)`，还能标页码。
-- 代价是慢 2–4 倍（绝对值 0.2 秒 vs 0.09 秒），以及偶发的表格列错位。
+- Traditional tools output an unstructured text stream. On dual-column papers, sentences from left and right columns frequently interleave, and over 60% of lines are broken short fragments. Models struggle to read this.
+- anymd preserves document structure: clean heading hierarchies (`## 3 Model Architecture` → `### 3.1 Encoder and Decoder Stacks`), tables formatted as Markdown pipe tables, and figures tagged with captions and page numbers.
+- The cost is a 2x slowdown (0.22s vs 0.09s) and occasional table column alignment glitches.
 
-**公式两者都救不了**。anymd 给的是 `Attention(Q, K, V ) = softmax( √ )V (1) d_k`——根号里的内容丢了位置。这是 PDF 本身的锅，不是工具能修的。
+Neither tool solves mathematical formulas: equations come out like `Attention(Q, K, V ) = softmax( √ )V (1) d_k`, where root symbols lose their placement. That is an inherent limitation of font glyph positioning in PDFs, not something a text converter can fix.
 
 ---
 
-## 10. 最后一个坑：打包时 `import.meta.url` 是 undefined
+## Packaging and the `import.meta.url` Quirk
 
-扩展在本机是直接放 `~/.pi/agent/extensions/` 下跑的，定位同包目录我用 `import.meta.url`。打成 npm 包、用 `pi -e` 加载之后，OCR shim 死活找不到：
+During local testing with a symlink in `~/.pi/agent/extensions/`, `import.meta.url` resolved the sibling `bin/tesseract` shim cleanly.
 
-```
+Once packaged for npm and run via `pi -e`, it suddenly failed:
+
+```text
 [pi-deepread] shim:  exists: false
 ```
 
-**原因**：Pi 用 jiti 加载扩展，模块被转成 CJS 执行，`import.meta` 在这个时候是空的。
+Pi uses jiti to load extensions, which converts modules into CommonJS at runtime. In that environment, `import.meta` is an empty object.
 
-**改法**：先试 `import.meta.url`（ESM 场景），拿不到再退回 `eval("typeof __dirname === 'string' ? __dirname : ''")`（CJS 场景），两个都失败就干脆不注入 shim——中文 OCR 失效，但其他功能正常。降级要静默，不能因为找不到一个可选组件就整个挂掉。
+The fix was a layered fallback: first check `import.meta.url` (ESM mode), then fall back to `eval("typeof __dirname === 'string' ? __dirname : ''")` (CJS mode). If both fail, silently skip injecting the shim.
 
----
-
-## 我没有做的
-
-- **YouTube 字幕/封面**：DeepSeek 的 YouTube 结果常落在 `music.youtube.com`，要额外处理；不做。
-- **图片搜索**：我的使用场景里不需要。
-- **存储 gzip**：能省 70% 磁盘，但要加解压代码、读取变慢；7 天 / 200 文件 / 64MB 的清理策略已经够用。
-- **会话内 URL 缓存**：收益是重复抓同一个链接时省一次请求，风险是拿到旧内容。重复抓取本来就不常见，不值。
-- **并发调到 5+**：能再快一点，但 429 的概率跟着涨。3 是实测的安全边界。
+**Graceful degradation should be silent.** Missing an optional OCR shim shouldn't crash the entire core search extension.
 
 ---
 
-## 如果你也想做类似的扩展
+## Features I Intentionally Left Out
 
-按重要性排：
+A few features were considered early on, but cut after evaluating the tradeoffs:
 
-1. **先 curl，再写码**。把 API 的真实返回、错误信息、边界全部摸一遍。我这次最大的收获（`need_content`）完全来自这一步。
-2. **把错误信息写全**。超长 query 要把拼好的串打出来，抓取失败要逐条列原因。你未来 90% 的调试都靠它。
-3. **降级要静默、主路径要响**。OCR shim 找不到就跳过；但 DeepSeek 挂了必须明确告诉你切到了 Exa。
-4. **别改别人 dist**。升级会毁掉一切，而且你真正想要的东西通常不是那一个数字。
-5. **把数字记下来**。不是给别人看的，是为了三天后你还能判断"这次是不是真的变慢了"。
+- **YouTube transcript scraping**: DeepSeek search results for YouTube frequently point to `music.youtube.com`, requiring specialized link-parsing gymnastics for minimal gain.
+- **Image search**: Rarely needed when using a coding assistant.
+- **gzip compression for cached responses**: Compressing saves ~70% disk space, but requires decompression logic on every read and adds latency. A plain-text LRU policy (7 days / 200 files / 64MB) keeps disk usage well within bounds without the complexity.
+- **In-session URL memory cache**: Sounds good to avoid duplicate fetches, but risks serving stale content. Agents rarely fetch the exact same URL twice in a single session, so the complexity isn't worth it.
+- **Concurrency higher than 3**: Higher concurrency saves modest fractions of a second while dramatically increasing the probability of `HTTP 429` rate limits. 3 is the sweet spot.
+
+---
+
+## Takeaways for Building Tool Extensions
+
+If you're building similar extensions for coding agents:
+
+1. **Test with curl before writing code.** Don't trust assumptions or skimmed documentation. Verify real payloads, error responses, and defaults first.
+2. **Include full context in error messages.** If a query is too long, print the compiled query. If a fetch fails, print the URL and error tier. You will save 90% of your debugging time.
+3. **Core failures should shout; optional features should degrade silently.** If DeepSeek fails, make sure the user knows it fell back to Exa. If the OCR shim is missing, just report it in `/web-status`.
+4. **Never patch vendor bundles.**
+5. **Record numbers while you test.** Not for presentation slides, but so that three days later you have an objective baseline to know whether performance actually degraded.
