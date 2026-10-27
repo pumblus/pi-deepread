@@ -217,8 +217,36 @@ A few features were considered early on, but cut after evaluating the tradeoffs:
 - **YouTube transcript scraping**: DeepSeek search results for YouTube frequently point to `music.youtube.com`, requiring specialized link-parsing gymnastics for minimal gain.
 - **Image search**: Rarely needed when using a coding assistant.
 - **gzip compression for cached responses**: Compressing saves ~70% disk space, but requires decompression logic on every read and adds latency. A plain-text LRU policy (7 days / 200 files / 64MB) keeps disk usage well within bounds without the complexity.
-- **In-session URL memory cache**: Sounds good to avoid duplicate fetches, but risks serving stale content. Agents rarely fetch the exact same URL twice in a single session, so the complexity isn't worth it.
-- **Concurrency higher than 3**: Higher concurrency saves modest fractions of a second while dramatically increasing the probability of `HTTP 429` rate limits. 3 is the sweet spot.
+
+Two items that used to be on this list came back after measurement — see [Round 2](#round-2-what-the-second-round-of-measurements-overturned) below: the in-session URL cache and the flat concurrency ceiling of 3.
+
+---
+
+## Round 2: What the Second Round of Measurements Overturned
+
+A month after release the extension had 273 downloads a month with no promotion. That was enough reason to stop adding features and start measuring the ones already there. I built `bench/` — a real-API harness that loads the actual extension through Pi's loader, so every number below is a measured call, not an estimate.
+
+| What | Before | After | Why it moved |
+| --- | --- | --- | --- |
+| Always-on prompt surface | 5,896 chars / 1,638 tok | 3,494 chars / 971 tok | Behaviour moved out of the system prompt into the tool output |
+| Paywalled pages that returned content | 0 of 6 | 5 of 6 | Reader proxy + Wayback fallback, raced in parallel |
+| A page that only renders in a browser | 12 s timeout, then failure | 2.8 s, 53 KB | The extractor was fine; the fetch was wrong |
+| arXiv `abs` page | 6,436 ms | 804 ms | Try the HTML `/html/` version first when it exists |
+| arXiv paper with no HTML version | 5,955 ms | 273 ms | Stop trying when the paper predates arXiv HTML |
+| Six concurrent fetches | 9,314 ms | 1,848 ms | Per-host scheduling instead of one global ceiling of 3 |
+| Re-fetching the same URL | 7,042 ms | 1 ms | In-session hot cache |
+| Local PDF for the agent | Failed with "Blocked internal address" | 143 ms of extracted text | A path is a source, not a URL |
+| Wikipedia markdown | 105 KB with 4 junk lines | 100 KB with 1 | Chrome stripping scoped to `article`/`main` |
+| A 163-char query with filters | Hard error | 617 ms, results | Trim the query instead of failing it |
+| 5 hits × 6,000 chars | 3 of 5 hits carried text | 5 of 5 | Reserve a per-hit floor in the budget |
+
+Three lessons that were not in the original build log:
+
+**The system prompt is the feature nobody benchmarks.** 1,638 tokens of always-on surface is paid on every single turn of every session, whether or not the model searches. Most of it was behaviour that only matters while a result is in front of the model — so it moved into the tool's own output, and the prompt kept only what changes a decision before the call. The companion rule: a tool description should say what the tool *is*, not how to be good at using it.
+
+**"Add a fallback" and "try again harder" are different designs.** The first version of the paywall handling added a second attempt after the first failed — which doubled the latency of every failure. Racing the tiers in parallel turned a 12-second timeout into a 2.8-second answer, with the same code.
+
+**Guessed-wrong items deserve a headline, not a footnote.** The in-session cache was cut in v0.1 because "agents rarely fetch the same URL twice". They do — after a compaction, when re-reading a doc, when two hits share a host. And the flat concurrency of 3 was not the sweet spot: it serialized fetches to *different* hosts, which never rate-limited each other. Both are now in, and both are 1-2 orders of magnitude better than the version that "avoided the complexity".
 
 ---
 
