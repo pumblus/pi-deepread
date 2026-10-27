@@ -599,62 +599,27 @@ function renderHits(hits: Hit[], contentChars: number, totalBudget: number): { b
 const webSearch = defineTool({
 	name: "web_search",
 	label: "Web Search",
-	promptSnippet: "DeepSeek search that returns extracted page text (not snippets), with Exa as fallback",
+	promptSnippet: "Search the web; each hit returns its page text, not a snippet",
 	promptGuidelines: [
-		"One call already returns the page text of every hit, so prefer web_search over search-then-fetch: only call fetch_content when a specific URL is missing or truncated.",
-		"Build queries with operators instead of extra parameters: site:host, -site:host, \"exact phrase\", lang:zh, after:YYYY-MM-DD, before:YYYY-MM-DD. Keep the query under 128 chars.",
-		"微信公众号 / 小红书 / YouTube / V2EX are outside DeepSeek's index; they route to Exa automatically when an Exa key is set, otherwise say the result is likely incomplete rather than fetching the same query again.",
-		"Full text of every hit is stored under a responseId — use get_search_content instead of re-searching when you need a passage you truncated away.",
+		"Never fetch_content a URL you just got from web_search — its text is already in the reply; use get_search_content for the parts that were truncated.",
+		"Filters compile into operators, so keep queries short: the compiled string must stay under 128 chars.",
 	],
 	description:
-		"Search the web and get each result's extracted page text in the same call (DeepSeek /v1/tools/search with need_content, " +
-		"Exa auto-fallback for 公众号/YouTube/V2EX/独立博客). Supports recencyFilter and domainFilter, compiled into " +
-		"site:/after: operators. Returns a responseId whose full text can be paged with get_search_content. Roughly ¥0.005 per call.",
+		"Search the web and get the extracted page text of every hit in the same call. Routes 公众号/小红书/YouTube/V2EX to Exa automatically. Returns a responseId for get_search_content.",
 	parameters: Type.Object({
-		query: Type.Optional(
-			Type.String({
-				description:
-					'Single query (max 128 chars once filters are compiled in). Operators: site:host, -site:host, "phrase", lang:zh, after:YYYY-MM-DD, before:YYYY-MM-DD.',
-			}),
-		),
-		queries: Type.Optional(
-			Type.Array(Type.String({ description: "Query variant." }), {
-				description: "Up to 3 query variants, searched concurrently.",
-				maxItems: 3,
-			}),
-		),
-		numResults: Type.Optional(
-			Type.Number({ description: "Results per query (1-10). Default 5.", minimum: 1, maximum: MAX_RESULTS }),
-		),
+		query: Type.Optional(Type.String({ description: 'Query; operators ok: site:, -site:, "…", lang:zh, after:YYYY-MM-DD.' })),
+		queries: Type.Optional(Type.Array(Type.String(), { description: "Up to 3 variants, searched in parallel.", maxItems: 3 })),
+		numResults: Type.Optional(Type.Number({ description: "Hits per query (1-10), default 5.", minimum: 1, maximum: MAX_RESULTS })),
 		contentChars: Type.Optional(
-			Type.Number({
-				description: "Page text shown per result, in characters (0-8000). 0 = titles and scores only. Default 1200.",
-				minimum: 0,
-				maximum: 8000,
-			}),
+			Type.Number({ description: "Page text per hit (0-8000), default 1200; 0 = titles only.", minimum: 0, maximum: 8000 }),
 		),
-		includeContent: Type.Optional(
-			Type.Boolean({ description: "Set false for a snippet-only search (equivalent to contentChars 0)." }),
-		),
+		includeContent: Type.Optional(Type.Boolean({ description: "false = titles only." })),
 		domainFilter: Type.Optional(
-			Type.Array(Type.String({ description: "example.com keeps only that host; -example.com excludes it." }), {
-				description: "Restrict or exclude hosts (max 2 each).",
-				maxItems: 4,
-			}),
+			Type.Array(Type.String(), { description: "Hosts: example.com to include, -example.com to exclude (max 2 each).", maxItems: 4 }),
 		),
-		recencyFilter: Type.Optional(
-			Type.Union([Type.Literal("day"), Type.Literal("week"), Type.Literal("month"), Type.Literal("year")], {
-				description: "Only results published within this window.",
-			}),
-		),
-		category: Type.Optional(
-			Type.String({ description: "Exa category (company, research paper, news, tweet, pdf, github). Ignored by DeepSeek." }),
-		),
-		provider: Type.Optional(
-			Type.Union([Type.Literal("auto"), Type.Literal("deepseek"), Type.Literal("exa")], {
-				description: "Engine to use. Default auto: DeepSeek, Exa for its blind spots or as fallback.",
-			}),
-		),
+		recencyFilter: Type.Optional(Type.String({ description: "Publish window: day|week|month|year." })),
+		category: Type.Optional(Type.String({ description: "Exa only: news, pdf, github, tweet…" })),
+		provider: Type.Optional(Type.String({ description: "Engine: auto|deepseek|exa." })),
 	}),
 	async execute(_toolCallId, params, signal, onUpdate) {
 		const variants = [...new Set([params.query ?? "", ...(params.queries ?? [])].map((q) => q.trim()).filter(Boolean))].slice(
@@ -778,26 +743,17 @@ async function fetchOne(url: string, signal?: AbortSignal): Promise<Page> {
 const fetchContent = defineTool({
 	name: "fetch_content",
 	label: "Fetch Content",
-	promptSnippet: "Extract URLs; PDFs and documents via local anymd (Markdown, tables, OCR)",
+	promptSnippet: "Fetch URLs or local files; documents convert locally with OCR",
 	promptGuidelines: [
-		"Use for a specific URL you already have. For discovery, web_search already returns page text — do not fetch links you just got from it unless the text was truncated.",
-		"Documents (PDF/DOCX/PPTX/XLSX/EPUB/images/audio/subtitles) are downloaded and converted locally — anymd first (Markdown + OCR), pdftotext as fallback — so arXiv and journal links work without any upload. For a document already on disk, the anymd MCP tools (outline/read/inspect) are better: they page through big PDFs and can OCR regions.",
-		"On HTTP 404/403 the page may be behind a login wall; try the bash + agent-reach route instead of retrying the same URL.",
+		"Pass a URL you already have, or a document already on disk (a plain path is enough) — it bypasses paywalls and anti-bot walls most scrapers fail on.",
 	],
 	description:
-		"Fetch one or more URLs and return their extracted text (DeepSeek /v1/tools/fetch, serialized under its QPS limit). " +
-		"Documents (PDF/Office/EPUB/images/audio) are converted locally by anymd into Markdown — heading tree, pipe tables, figure captions with image paths, `<!-- page N -->` markers, OCR for scans — with pdftotext as the fallback. " +
-		"Text is stored under a responseId for paging with get_search_content.",
+		"Return the extracted text of URLs or local files. Documents (PDF/Office/EPUB/images/audio/subtitles) are converted to Markdown locally with anymd, pdftotext as fallback — nothing is uploaded. Text is stored under a responseId.",
 	parameters: Type.Object({
-		url: Type.Optional(Type.String({ description: "Absolute http(s) URL." })),
-		urls: Type.Optional(
-			Type.Array(Type.String({ description: "Absolute http(s) URL, in order." }), {
-				description: `Up to ${MAX_URLS} URLs fetched in order.`,
-				maxItems: MAX_URLS,
-			}),
-		),
+		url: Type.Optional(Type.String({ description: "http(s) URL or local file path." })),
+		urls: Type.Optional(Type.Array(Type.String(), { description: `Up to ${MAX_URLS} URLs/paths, in order.`, maxItems: MAX_URLS })),
 		maxChars: Type.Optional(
-			Type.Number({ description: "Text per URL in characters (200-40000). Default 4000.", minimum: 200, maximum: 40000 }),
+			Type.Number({ description: "Text per item (200-40000), default 4000.", minimum: 200, maximum: 40000 }),
 		),
 	}),
 	async execute(_toolCallId, params, signal, onUpdate) {
@@ -1088,32 +1044,21 @@ async function pdfToText(url: string, signal?: AbortSignal): Promise<Page> {
 const getSearchContent = defineTool({
 	name: "get_search_content",
 	label: "Get Search Content",
-	promptSnippet: "Page through the full text stored under a web_search / fetch_content responseId",
-	promptGuidelines: [
-		"Pass findText to jump to passages instead of paging blindly; it returns short windows around each match.",
-		"responseIds last 7 days. If an id is unknown, re-run web_search instead of guessing.",
-	],
-	description:
-		"Retrieve the full stored text behind a web_search or fetch_content responseId: pick a query/URL index, page through it " +
-		"with offset/limit, or jump to passages with findText. Use this instead of re-running a search to recover truncated text.",
+	promptSnippet: "Page or grep the full text stored under a responseId",
+	promptGuidelines: ["findText beats paging for long text; ids expire after 7 days."],
+	description: "Read the full text stored behind a responseId: pick a query/URL, page with offset/limit, or jump to matches with findText.",
 	parameters: Type.Object({
-		responseId: Type.String({ description: "responseId returned by web_search or fetch_content." }),
-		query: Type.Optional(Type.String({ description: "Select the stored query by its text (default: first query)." })),
-		queryIndex: Type.Optional(Type.Number({ description: "Select the stored query by index. Default 0.", minimum: 0 })),
-		url: Type.Optional(Type.String({ description: "Select a stored result/page by URL (exact or substring)." })),
-		urlIndex: Type.Optional(Type.Number({ description: "Select a stored result/page by index. Default 0.", minimum: 0 })),
-		offset: Type.Optional(Type.Number({ description: "Character offset. Default 0.", minimum: 0 })),
-		limit: Type.Optional(Type.Number({ description: "Characters to return (1-30000). Default 8000.", minimum: 1, maximum: 30000 })),
+		responseId: Type.String({ description: "responseId from web_search or fetch_content." }),
+		query: Type.Optional(Type.String({ description: "Pick a stored query by text." })),
+		queryIndex: Type.Optional(Type.Number({ description: "Pick a stored query by index, default 0.", minimum: 0 })),
+		url: Type.Optional(Type.String({ description: "Pick a stored block by URL substring." })),
+		urlIndex: Type.Optional(Type.Number({ description: "Pick a stored block by index, default 0.", minimum: 0 })),
+		offset: Type.Optional(Type.Number({ description: "Char offset, default 0.", minimum: 0 })),
+		limit: Type.Optional(Type.Number({ description: "Chars to return (1-30000), default 8000.", minimum: 1, maximum: 30000 })),
 		findText: Type.Optional(
-			Type.Union([Type.String({ description: "Text to find." }), Type.Array(Type.String({ description: "Text to find." }), { maxItems: 10 })], {
-				description: "Find one or more passages and return windows around them instead of a contiguous block.",
-			}),
+			Type.Union([Type.String(), Type.Array(Type.String(), { maxItems: 10 })], { description: "Substring(s) to jump to: returns windows, not a contiguous block." }),
 		),
-		findMode: Type.Optional(
-			Type.Union([Type.Literal("exact"), Type.Literal("case-insensitive"), Type.Literal("fuzzy")], {
-				description: "Match mode for findText. Default case-insensitive.",
-			}),
-		),
+		findMode: Type.Optional(Type.String({ description: "findText mode: exact|case-insensitive|fuzzy." })),
 	}),
 	async execute(_toolCallId, params) {
 		const stored = loadStored(params.responseId);

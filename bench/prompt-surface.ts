@@ -2,7 +2,7 @@
  *  Everything here is paid on EVERY turn, so it is the metric the package gets judged on. */
 import { loadTools } from "./lib.ts";
 
-const tools = loadTools();
+const tools = await loadTools();
 
 interface Row {
 	tool: string;
