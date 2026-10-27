@@ -112,6 +112,36 @@ if (want("p1")) {
 			source: meta(text)?.source,
 		});
 	}
+
+	// 4. Boilerplate stripping, measured offline so the crawl path cannot flatter it:
+	//    the same HTML through a naive tag strip versus the article-scoped extractor.
+	const { htmlToText } = await import("../extensions/web-access.ts");
+	const NAVY = [
+		"https://www.theverge.com/",
+		"https://docs.python.org/3/library/asyncio.html",
+		"https://en.wikipedia.org/wiki/Transformer_(deep_learning_architecture)",
+	];
+	for (const url of NAVY) {
+		const started = Date.now();
+		try {
+			const res = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0 (Macintosh) Chrome/131.0" } });
+			const html = await res.text();
+			const naive = html.replace(/<script[\s\S]*?<\/script>/gi, " ").replace(/<style[\s\S]*?<\/style>/gi, " ").replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+			const scoped = htmlToText(html).text;
+			add("p1", {
+				metric: `sanitize ${new URL(url).hostname}`,
+				ms: Date.now() - started,
+				naiveChars: naive.length,
+				scopedChars: scoped.length,
+				keptPct: Number(((scoped.length / naive.length) * 100).toFixed(1)),
+				naiveJunk: boiler.filter((word) => naive.toLowerCase().includes(word.toLowerCase())).length,
+				scopedJunk: boiler.filter((word) => scoped.toLowerCase().includes(word.toLowerCase())).length,
+				scopedFirst: scoped.split("\n").find((line) => line.length > 60)?.slice(0, 60) ?? "",
+			});
+		} catch (error) {
+			add("p1", { metric: `sanitize ${new URL(url).hostname}`, err: error instanceof Error ? error.message.slice(0, 60) : String(error) });
+		}
+	}
 }
 
 // ------------------------------------------------------------------ P2

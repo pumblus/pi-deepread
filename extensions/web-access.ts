@@ -31,7 +31,7 @@ import {
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { homedir, tmpdir } from "node:os";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Type } from "@earendil-works/pi-ai";
 import { defineTool, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -229,8 +229,9 @@ async function requestJson(
 	let lastError: unknown;
 	for (let attempt = 0; attempt < 3; attempt++) {
 		try {
-			const res = await fetch(url, { ...init, signal: combined });
+			const res = await paced(url, () => fetch(url, { ...init, signal: combined }));
 			if (res.status === 429) {
+				noteRateLimit(hostOf(url));
 				if (attempt < 2) {
 					await sleep(1200 * (attempt + 1));
 					continue;
@@ -242,6 +243,7 @@ async function requestJson(
 				const detail = text.slice(0, 300).replace(/\s+/g, " ");
 				throw new Error(`HTTP ${res.status} from ${new URL(url).host}: ${detail}`);
 			}
+			noteOk(hostOf(url));
 			try {
 				return JSON.parse(text);
 			} catch {
@@ -266,48 +268,88 @@ async function requestJson(
 	throw lastError ?? new Error(`${new URL(url).host} request failed`);
 }
 
-/** Serialize DeepSeek fetch starts so batches stay under the endpoint's QPS limit.
- *  Three requests may be in flight at once and starts are spaced gap/3 apart: the article
- *  measured ~30% HTTP 429 at 10 threads, but 1-3 concurrent (or 0.8-1.0 s serial) is clean. */
-const FETCH_MAX_INFLIGHT = 3;
-let inflight = 0;
-let nextStartAt = 0;
-const slotWaiters: Array<() => void> = [];
+/** Outbound scheduling, keyed by host.
+ *
+ *  One global 3-slot pacer used to serialize every request in the process: a batch of five
+ *  unrelated sites waited on each other's latency, and a slow archive.org snapshot held up
+ *  every DeepSeek fetch. Politeness is a per-host property, so the budget is per host: each
+ *  host starts conservatively, climbs while it answers, and halves the moment it returns 429.
+ *  A global ceiling still caps total sockets so a 20-URL batch cannot flood the network. */
+const HOST_LIMIT_START = 4;
+const HOST_LIMIT_MAX = 8;
+const GLOBAL_MAX_INFLIGHT = 12;
 
-function takeSlot(): Promise<void> {
-	if (inflight < FETCH_MAX_INFLIGHT) {
-		inflight++;
-		return Promise.resolve();
+interface HostState {
+	inflight: number;
+	limit: number;
+	nextStartAt: number;
+	waiters: Array<() => void>;
+}
+
+const hostStates = new Map<string, HostState>();
+let globalInflight = 0;
+const globalWaiters: Array<() => void> = [];
+
+function hostState(host: string): HostState {
+	let state = hostStates.get(host);
+	if (!state) {
+		state = { inflight: 0, limit: HOST_LIMIT_START, nextStartAt: 0, waiters: [] };
+		hostStates.set(host, state);
 	}
-	return new Promise<void>((resolve) => {
-		slotWaiters.push(() => {
-			inflight++;
-			resolve();
-		});
-	});
+	return state;
 }
 
-function freeSlot(): void {
-	inflight--;
-	slotWaiters.shift()?.();
+function hostOf(url: string): string {
+	try {
+		return new URL(url).host.toLowerCase();
+	} catch {
+		return "invalid";
+	}
 }
 
-async function paceStart(): Promise<void> {
-	const now = Date.now();
-	const at = Math.max(now, nextStartAt);
-	nextStartAt = at + Math.max(150, Math.round(fetchGapMs() / 3));
-	if (at > now) await sleep(at - now);
+async function acquire(host: string): Promise<void> {
+	if (globalInflight >= GLOBAL_MAX_INFLIGHT) await new Promise<void>((wake) => globalWaiters.push(wake));
+	globalInflight++;
+	const state = hostState(host);
+	// Re-checked in a loop: a wake-up can be consumed by an earlier waiter.
+	while (state.inflight >= state.limit) await new Promise<void>((wake) => state.waiters.push(wake));
+	state.inflight++;
+	// Space starts just enough that a burst does not read as a scan.
+	const gap = Math.min(300, Math.max(60, Math.round(fetchGapMs() / 4)));
+	const at = Math.max(Date.now(), state.nextStartAt);
+	state.nextStartAt = at + gap;
+	if (at > Date.now()) await sleep(at - Date.now());
 }
 
-function throttle<T>(task: () => Promise<T>): Promise<T> {
-	return takeSlot().then(async () => {
-		try {
-			await paceStart();
-			return await task();
-		} finally {
-			freeSlot();
-		}
-	});
+function release(host: string): void {
+	const state = hostState(host);
+	state.inflight = Math.max(0, state.inflight - 1);
+	state.waiters.shift()?.();
+	globalInflight = Math.max(0, globalInflight - 1);
+	globalWaiters.shift()?.();
+}
+
+/** A 429 is the host stating its real ceiling — obey it, then climb back one slot at a time. */
+function noteRateLimit(host: string): void {
+	const state = hostState(host);
+	state.limit = Math.max(1, Math.floor(state.limit / 2));
+	state.nextStartAt = Date.now() + 800;
+}
+
+function noteOk(host: string): void {
+	const state = hostState(host);
+	if (state.limit < HOST_LIMIT_MAX) state.limit += 1;
+}
+
+/** Every outbound request goes through here. */
+async function paced<T>(url: string, task: () => Promise<T>): Promise<T> {
+	const host = hostOf(url);
+	await acquire(host);
+	try {
+		return await task();
+	} finally {
+		release(host);
+	}
 }
 
 /** Run tasks with a concurrency cap while keeping result order stable. */
@@ -385,23 +427,22 @@ interface Page {
 	url: string;
 	title: string;
 	content: string;
-	source: "deepseek" | "anymd" | "pdftotext" | "http";
+	source: "deepseek" | "anymd" | "pdftotext" | "http" | "jina" | "wayback" | "index" | "cache";
+	note?: string;
 }
 
 async function dsFetchPage(url: string, signal?: AbortSignal): Promise<Page> {
 	const key = deepseekKey();
 	if (!key) throw new Error("DeepSeek API key missing (web-search.json: deepseekApiKey, or DEEPSEEK_API_KEY)");
-	const data = await throttle(() =>
-		requestJson(
-			`${DS_BASE}/v1/tools/fetch`,
-			{
-				method: "POST",
-				headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
-				body: JSON.stringify({ url }),
-			},
-			fetchTimeoutMs(),
-			signal,
-		),
+	const data = await requestJson(
+		`${DS_BASE}/v1/tools/fetch`,
+		{
+			method: "POST",
+			headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
+			body: JSON.stringify({ url }),
+		},
+		fetchTimeoutMs(),
+		signal,
 	);
 	const content = str(data?.content);
 	if (!content) throw new Error(`DeepSeek returned no content for ${url}`);
@@ -684,6 +725,7 @@ const webSearch = defineTool({
 					throw error;
 				}
 			}
+			rememberHits(hits);
 			const elapsed = ((Date.now() - started) / 1000).toFixed(2);
 			return { entry: { query, provider: route, note, hits }, elapsed };
 		});
@@ -712,6 +754,15 @@ const webSearch = defineTool({
 
 /** Extraction chain: documents go local-first (anymd → pdftotext), pages go DeepSeek-first. */
 async function fetchOne(url: string, signal?: AbortSignal): Promise<Page> {
+	// A document already on disk: no download, no SSRF check, no network at all.
+	const local = localPathOf(url);
+	if (local) return localToText(local);
+	if (looksLikePath(url)) throw new Error(`No such local file: ${url}`);
+
+	// The model often re-fetches a URL it just saw in web_search results — answer from memory.
+	const hot = hotLookup(url);
+	if (hot) return { url: hot.url, title: hot.title, content: hot.content, source: "cache", note: "already crawled by web_search in this session, no new request" };
+
 	const parsed = assertFetchable(url);
 	const namedPdf = /\.pdf$/i.test(parsed.pathname);
 	const namedDoc = DOCUMENT_EXT.test(parsed.pathname);
@@ -721,23 +772,269 @@ async function fetchOne(url: string, signal?: AbortSignal): Promise<Page> {
 	const kind = namedDoc ? "document" : likelyDoc ? await peekKind(url, signal) : "page";
 	const attempts: Array<[string, () => Promise<Page>]> = [];
 	if (kind === "document") {
+		// arXiv PDFs are typeset twice; the HTML build is a fraction of the bytes and keeps equations.
+		const htmlVersion = arxivHtmlVersion(url);
+		if (htmlVersion) attempts.push(["deepseek", () => dsFetchPage(htmlVersion, signal)]);
 		attempts.push(["anymd", () => anymdToText(url, signal)]);
 		if (namedPdf || !namedDoc) attempts.push(["pdftotext", () => pdfToText(url, signal)]);
 		attempts.push(["http", () => httpToText(url, signal)]);
 	} else {
 		attempts.push(["deepseek", () => dsFetchPage(url, signal)]);
 		attempts.push(["http", () => httpToText(url, signal)]);
+		// Both live crawls are routinely refused by paywalls and anti-bot walls. Rather than
+		// failing, take the same page from a reader proxy, an archive, or DeepSeek's index.
+		attempts.push(["unblock", () => unblock(url, signal)]);
 	}
 	const errors: string[] = [];
 	for (const [name, run] of attempts) {
 		if (signal?.aborted) throw new Error("Aborted");
 		try {
-			return await run();
+			const page = await run();
+			// A 60-char "安全验证" page is a failure that HTTP status cannot express.
+			if (kind === "page" && looksLikeWall(page.content)) {
+				errors.push(`${name}: only ${num(page.content.length)} chars, looks like a wall or a JS shell`);
+				continue;
+			}
+			return page;
 		} catch (error) {
 			errors.push(`${name}: ${error instanceof Error ? error.message : String(error)}`);
 		}
 	}
 	throw new Error(`All extraction paths failed for ${url}\n  ${errors.join("\n  ")}`);
+}
+
+// ---------------------------------------------------------------- hot cache
+
+/** web_search already pulls the page text of every hit (4-15 K chars) and writes it to disk;
+ *  the model, however, often calls fetch_content on the same URL anyway. Keeping the last
+ *  few searches in memory turns that second call into a 0 ms map lookup instead of a crawl. */
+const HOT_MAX = 80;
+const HOT_TTL_MS = 30 * 60_000;
+const HOT_MIN_CHARS = 400;
+const hotCache = new Map<string, { url: string; title: string; content: string; at: number }>();
+
+/** Compare URLs the way a reader would: ignore #anchors, www, trailing slashes and tracking params. */
+function urlKey(url: string): string {
+	try {
+		const parsed = new URL(url);
+		for (const key of [...parsed.searchParams.keys()]) if (/^(utm_|fbclid$|gclid$|spm$|ref$|source$)/i.test(key)) parsed.searchParams.delete(key);
+		return `${parsed.hostname.replace(/^www\./, "")}${parsed.pathname.replace(/\/+$/, "")}${parsed.search}`.toLowerCase();
+	} catch {
+		return url.trim().toLowerCase();
+	}
+}
+
+function rememberHits(hits: Hit[]): void {
+	const cutoff = Date.now() - HOT_TTL_MS;
+	for (const [key, entry] of hotCache) if (entry.at < cutoff) hotCache.delete(key);
+	for (const hit of hits) {
+		if (!hit.url || hit.content.length < HOT_MIN_CHARS) continue;
+		const key = urlKey(hit.url);
+		hotCache.delete(key);
+		hotCache.set(key, { url: hit.url, title: hit.title, content: hit.content, at: Date.now() });
+	}
+	while (hotCache.size > HOT_MAX) hotCache.delete(hotCache.keys().next().value as string);
+}
+
+function hotLookup(url: string): { url: string; title: string; content: string } | undefined {
+	const key = urlKey(url);
+	const entry = hotCache.get(key);
+	if (!entry) return undefined;
+	if (Date.now() - entry.at > HOT_TTL_MS) {
+		hotCache.delete(key);
+		return undefined;
+	}
+	// Refresh LRU position without changing the timestamp.
+	hotCache.delete(key);
+	hotCache.set(key, entry);
+	return entry;
+}
+
+// ------------------------------------------------------------- local files
+
+/** A document already on disk needs no download and no SSRF check — resolve it directly. */
+function localPathOf(input: string): string | undefined {
+	const raw = input.trim();
+	if (/^file:\/\//i.test(raw)) {
+		try {
+			const path = fileURLToPath(raw);
+			return statSync(path).isFile() ? path : undefined;
+		} catch {
+			return undefined;
+		}
+	}
+	if (/^[a-z][a-z0-9+.-]*:/i.test(raw)) return undefined; // any other scheme is not a path
+	const candidate = raw.startsWith("~") ? join(homedir(), raw.slice(1)) : resolve(raw);
+	try {
+		return statSync(candidate).isFile() ? candidate : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+/** Looks like a filesystem path rather than a URL — used only to sharpen the error message. */
+function looksLikePath(input: string): boolean {
+	const raw = input.trim();
+	return /^file:\/\//i.test(raw) || (!/^[a-z][a-z0-9+.-]*:\/\//i.test(raw) && (raw.startsWith("/") || raw.startsWith("~") || raw.startsWith("./")));
+}
+
+// ------------------------------------------------------------ blocked hosts
+
+/** Markers that mean "this text is a challenge page, not the article". */
+const WALL_MARKERS =
+	/安全验证|人机验证|环境异常|请开启JavaScript|Just a moment|Enable JavaScript and cookies|Access Denied|Attention Required|Verify you are human|cf-browser-verification|unusual traffic|captcha/i;
+const MIN_PAGE_CHARS = 120;
+
+function looksLikeWall(text: string): boolean {
+	const head = text.replace(/\s+/g, " ").trim();
+	return head.length < MIN_PAGE_CHARS || WALL_MARKERS.test(head.slice(0, 400));
+}
+
+/** r.jina.ai prefixes every response with Title/URL Source/Markdown Content lines. */
+function stripReaderHeader(raw: string): { title: string; text: string } {
+	const lines = raw.split("\n");
+	let index = 0;
+	let title = "";
+	for (; index < lines.length; index++) {
+		const match = /^(Title|URL Source|Published Time|Markdown Content|Warning):\s*(.*)$/.exec(lines[index] ?? "");
+		if (!match) break;
+		if (match[1] === "Title") title = match[2]?.trim() ?? "";
+	}
+	return { title, text: lines.slice(index).join("\n").trim() };
+}
+
+/** r.jina.ai renders the page server-side and slips past a lot of paywalls (FT, Bloomberg).
+ *  Anonymous use is rate limited, so it is only ever a fallback. */
+async function jinaReader(url: string, signal?: AbortSignal): Promise<Page> {
+	// The reader answers in 2-3 s when it can render the page at all; waiting 12 s only
+	// delays the archive and index paths that would have answered meanwhile.
+	const timeout = AbortSignal.timeout(8_000);
+	const res = await paced(`https://r.jina.ai/${url}`, () =>
+		fetch(`https://r.jina.ai/${url}`, {
+			headers: { Accept: "text/plain", "User-Agent": BROWSER_UA },
+			signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
+		}),
+	);
+	if (!res.ok) throw new Error(`reader HTTP ${res.status}`);
+	const { title, text } = stripReaderHeader(await res.text());
+	// A reader that hands back a few hundred characters is echoing a login/JS wall.
+	if (text.length < 400 || looksLikeWall(text)) throw new Error(`reader returned a challenge page (${num(text.length)} chars)`);
+	return { url, title: title || url, content: text, source: "jina" };
+}
+
+/** The Wayback Machine kept what the site itself now blocks. `/web/2/<url>` redirects to
+ *  the closest snapshot, so no availability lookup (and no extra 429-prone request) is needed. */
+async function wayback(url: string, signal?: AbortSignal): Promise<Page> {
+	const timeout = AbortSignal.timeout(10_000);
+	const combined = signal ? AbortSignal.any([signal, timeout]) : timeout;
+	let res: Response | undefined;
+	for (let attempt = 0; attempt < 2; attempt++) {
+		res = await paced("https://web.archive.org", () =>
+			fetch(`https://web.archive.org/web/2/${url}`, {
+				redirect: "follow",
+				headers: { Accept: "text/html", "User-Agent": BROWSER_UA },
+				signal: combined,
+			}),
+		);
+		// archive.org rate limits bursts even when the snapshot exists — one paced retry wins it back.
+		if (res.status !== 429 || attempt === 1) break;
+		await res.body?.cancel();
+		await sleep(1500);
+	}
+	if (!res?.ok) throw new Error(`archive HTTP ${res?.status ?? "error"}`);
+	const parsed = htmlToText(await res.text());
+	if (looksLikeWall(parsed.text)) throw new Error("archive has no usable snapshot");
+	return { url, title: parsed.title || url, content: parsed.text, source: "wayback" };
+}
+
+/** Race both unblocking paths and keep whichever answers first with real text. */
+async function blockedPass(url: string, signal?: AbortSignal): Promise<Page> {
+	const controller = new AbortController();
+	const linked = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
+	const runners: Array<[string, (u: string, s: AbortSignal) => Promise<Page>]> = [
+		["jina", jinaReader],
+		["wayback", wayback],
+	];
+	const errors: string[] = [];
+	try {
+		return await new Promise<Page>((resolve, reject) => {
+			let pending = runners.length;
+			for (const [name, run] of runners) {
+				run(url, linked).then(
+					(page) => {
+						controller.abort(); // the loser keeps no bandwidth
+						resolve(page);
+					},
+					(error) => {
+						errors.push(`${name}: ${error instanceof Error ? error.message.split("\n")[0] : String(error)}`);
+						pending -= 1;
+						if (pending === 0) reject(new Error(errors.join("; ")));
+					},
+				);
+			}
+		});
+	} finally {
+		controller.abort();
+	}
+}
+
+/** One attempt for blocked hosts: the reader/archive race for the real page, the index as a
+ *  cheap parallel backup. Running them together turns a 27 s worst case into ~12 s. */
+async function unblock(url: string, signal?: AbortSignal): Promise<Page> {
+	// Hard budget: a host that refuses everything must not stall the whole batch.
+	const budget = AbortSignal.timeout(12_000);
+	const scoped = signal ? AbortSignal.any([signal, budget]) : budget;
+	const indexed = indexSubstitute(url, scoped).catch(() => undefined);
+	try {
+		return await blockedPass(url, scoped);
+	} catch (error) {
+		const substitute = await indexed;
+		if (substitute) return substitute;
+		throw error;
+	}
+}
+
+/** Last resort: DeepSeek's index often holds the page the live crawl cannot reach.
+ *  Search by host + path slug, prefer an exact URL match, else an obviously related page. */
+async function indexSubstitute(url: string, signal?: AbortSignal): Promise<Page> {
+	const parsed = new URL(url);
+	const slug = decodeURIComponent(parsed.pathname)
+		.split(/[/_\-.]+/)
+		.filter((word) => word.length > 2 && !/^(index|html?|php|amp|article|news|story|s)$/i.test(word))
+		.slice(-6)
+		.join(" ");
+	if (!slug) throw new Error("nothing to look up in the index");
+	const hits = await dsSearch(`${slug} site:${parsed.hostname.replace(/^www\./, "")}`, 6, signal);
+	const wanted = urlKey(url);
+	const exact = hits.find((hit) => urlKey(hit.url) === wanted);
+	// A substitute is only honest when it is the same host and shares a real slug token —
+	// otherwise "nearest page" turns into a different story with the same site name.
+	const tokens = slug.split(" ").filter((word) => word.length >= 4);
+	const related = hits.find(
+		(hit) => new URL(hit.url).hostname.replace(/^www\./, "") === parsed.hostname.replace(/^www\./, "") && tokens.some((token) => urlKey(hit.url).includes(token.toLowerCase())),
+	);
+	const winner = exact ?? related;
+	if (!winner || winner.content.length < HOT_MIN_CHARS) throw new Error("no indexed copy of this page");
+	return {
+		url: winner.url,
+		title: winner.title,
+		content: winner.content,
+		source: "index",
+		note: exact
+			? `${parsed.hostname} refused the live crawl; text comes from DeepSeek's index of the same URL`
+			: `${parsed.hostname} refused the live crawl and has no exact indexed copy; this is the closest indexed page on the same story`,
+	};
+}
+
+/** arXiv renders every paper since Dec 2023 as HTML at /html/<id>; the PDF is 10-100x heavier.
+ *  Older papers were never typeset to HTML, so probing /html/ for them only wastes a round trip. */
+function arxivHtmlVersion(url: string): string | undefined {
+	const match = /^https?:\/\/arxiv\.org\/(?:abs|pdf)\/(\d{2})(\d{2})\.\d{4,5}(v\d+)?(?:\.pdf)?$/i.exec(url.trim());
+	if (!match) return undefined; // old-style ids (hep-th/9901001) and non-paper URLs
+	const stamped = Number(match[1]) * 100 + Number(match[2]);
+	if (!(stamped >= 2312)) return undefined; // before 2023-12 arXiv had no HTML build
+	const id = /arxiv\.org\/(?:abs|pdf)\/([^?#]+?)(?:\.pdf)?$/i.exec(url.trim())?.[1];
+	return id ? `https://arxiv.org/html/${id}` : undefined;
 }
 
 const fetchContent = defineTool({
@@ -769,9 +1066,9 @@ const fetchContent = defineTool({
 		const failures: string[] = [];
 		let budget = 60_000;
 
-		// Up to three URLs at a time: the DeepSeek throttle paces request starts and documents
-		// are parsed locally, so the bottleneck is I/O, not the endpoint's QPS budget.
-		const outcomes = await mapLimit(urls, 3, async (url, index) => {
+		// Six at a time: the per-host scheduler already caps concurrency where it matters, so the
+		// batch limit only needs to keep a wide fan-out (20 links) from opening 20 sockets.
+		const outcomes = await mapLimit(urls, 6, async (url, index) => {
 			if (signal?.aborted) throw new Error("Aborted");
 			onUpdate?.({ content: [{ type: "text", text: `Fetching ${index + 1}/${urls.length}: ${url}` }] });
 			const started = Date.now();
@@ -795,7 +1092,9 @@ const fetchContent = defineTool({
 			const shown = truncate(page.content, take);
 			budget -= Math.min(page.content.length, take);
 			blocks.push(
-				`## [${index + 1}] ${page.title}\n${page.url}\n${num(page.content.length)} 字符 · ${page.source} · ${elapsed.toFixed(2)}s\n\n${shown}`,
+				`## [${index + 1}] ${page.title}\n${page.url}\n${num(page.content.length)} 字符 · ${page.source} · ${elapsed.toFixed(2)}s${
+					page.note ? `\nnote: ${page.note}` : ""
+				}\n\n${shown}`,
 			);
 		}
 
@@ -835,31 +1134,57 @@ function decodeEntities(input: string): string {
 	});
 }
 
-function htmlToText(html: string): { title: string; text: string } {
-	const titleMatch = /<title[^>]*>([\s\S]*?)<\/title>/i.exec(html);
-	const title = titleMatch ? decodeEntities(titleMatch[1].replace(/<[^>]+>/g, "")).trim() : "";
-	const body = html
+/** Blocks that carry navigation, cookie banners and share widgets — never the article itself. */
+const CHROME_BLOCK = /<(nav|aside|footer|header|form|button|select|dialog|iframe|figure|figcaption)\b[^>]*>[\s\S]*?<\/\1>/gi;
+
+/** A whole line of site furniture. Anchored, so it cannot eat a sentence that starts with a link. */
+const CHROME_LINE =
+	/^(?:home|menu|search|share|subscribe|newsletter|sign in|log in|sign up|register|advertisement|skip to (?:main )?content|accept (?:all|cookies)|cookie (?:policy|settings|preferences)|privacy policy|terms of service|all rights reserved|follow us|back to top|read more|related (?:articles|posts|stories)|table of contents|previous|next|we use cookies\b|this (?:site|website) uses cookies\b)/i;
+
+function stripTags(fragment: string): string {
+	const body = fragment
 		.replace(/<!--[\s\S]*?-->/g, " ")
 		.replace(/<(script|style|noscript|svg|template)\b[^>]*>[\s\S]*?<\/\1>/gi, " ")
 		.replace(/<\/(p|div|section|article|header|footer|li|tr|h[1-6]|blockquote|pre|br)>/gi, "\n")
 		.replace(/<br\s*\/?>/gi, "\n")
 		.replace(/<[^>]+>/g, " ");
-	const text = decodeEntities(body)
+	const lines = decodeEntities(body)
 		.replace(/[ \t\u00a0]+/g, " ")
 		.replace(/ *\n */g, "\n")
-		.replace(/\n{3,}/g, "\n\n")
-		.trim();
-	return { title, text };
+		.split("\n")
+		.map((line) => line.trim())
+		.filter((line) => line.length > 0 && !(line.length < 60 && CHROME_LINE.test(line)))
+		.join("\n");
+	return lines.replace(/\n{3,}/g, "\n\n").trim();
+}
+
+export function htmlToText(html: string): { title: string; text: string } {
+	const titleMatch = /<title[^>]*>([\s\S]*?)<\/title>/i.exec(html);
+	const title = titleMatch ? decodeEntities(titleMatch[1].replace(/<[^>]+>/g, "")).trim() : "";
+	const withoutChrome = html
+		.replace(/<!--[\s\S]*?-->/g, " ")
+		.replace(/<(script|style|noscript|svg|template)\b[^>]*>[\s\S]*?<\/\1>/gi, " ")
+		.replace(CHROME_BLOCK, " ");
+	// Most sites mark the article up semantically; when they do, the surrounding chrome is
+	// irrelevant and skipping it removes 60-80% of the characters with no information loss.
+	const scoped = /<article\b[^>]*>([\s\S]*?)<\/article>/i.exec(withoutChrome)?.[1] ?? /<main\b[^>]*>([\s\S]*?)<\/main>/i.exec(withoutChrome)?.[1];
+	if (scoped) {
+		const text = stripTags(scoped);
+		if (text.length >= 500) return { title, text };
+	}
+	return { title, text: stripTags(withoutChrome) };
 }
 
 /** Direct HTTP fallback: DeepSeek's crawler does not reach every host. */
 async function httpToText(url: string, signal?: AbortSignal): Promise<Page> {
 	const timeout = AbortSignal.timeout(fetchTimeoutMs());
-	const res = await fetch(url, {
-		redirect: "follow",
-		headers: { "User-Agent": BROWSER_UA, Accept: "text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.5" },
-		signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
-	});
+	const res = await paced(url, () =>
+		fetch(url, {
+			redirect: "follow",
+			headers: { "User-Agent": BROWSER_UA, Accept: "text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.5" },
+			signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
+		}),
+	);
 	if (!res.ok) throw new Error(`HTTP ${res.status}`);
 	const type = (res.headers.get("content-type") ?? "").toLowerCase();
 	if (!/text\/|application\/(xhtml|xml|json)/.test(type)) {
@@ -885,10 +1210,12 @@ const DOCUMENT_MIME =
 async function peekKind(url: string, signal?: AbortSignal): Promise<"document" | "page"> {
 	try {
 		const timeout = AbortSignal.timeout(15_000);
-		const res = await fetch(url, {
-			headers: { Range: "bytes=0-2047", "User-Agent": BROWSER_UA },
-			signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
-		});
+		const res = await paced(url, () =>
+			fetch(url, {
+				headers: { Range: "bytes=0-2047", "User-Agent": BROWSER_UA },
+				signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
+			}),
+		);
 		if (!res.ok && res.status !== 206) {
 			await res.body?.cancel();
 			return "page";
@@ -953,7 +1280,7 @@ async function downloadToTemp(url: string, signal?: AbortSignal): Promise<string
 	const ext = (parsed.pathname.match(/\.[a-z0-9]{1,5}$/i)?.[0] ?? "").toLowerCase();
 	const timeout = AbortSignal.timeout(fetchTimeoutMs());
 	const combined = signal ? AbortSignal.any([signal, timeout]) : timeout;
-	const res = await fetch(url, { signal: combined, redirect: "follow", headers: { "User-Agent": BROWSER_UA } });
+	const res = await paced(url, () => fetch(url, { signal: combined, redirect: "follow", headers: { "User-Agent": BROWSER_UA } }));
 	if (!res.ok) throw new Error(`download failed: HTTP ${res.status}`);
 	const declared = Number(res.headers.get("content-length") ?? 0);
 	if (declared && declared > PDF_MAX_BYTES) throw new Error(`file is ${num(declared)} bytes, over the ${num(PDF_MAX_BYTES)}-byte cap`);
@@ -976,29 +1303,33 @@ async function downloadToTemp(url: string, signal?: AbortSignal): Promise<string
 }
 
 /** anymd → clean Markdown: structure, tables, OCR, transcripts. Preferred for documents. */
+async function execAnymd(path: string): Promise<string> {
+	const text = await new Promise<string>((resolvePromise, reject) => {
+		execFile(ANYMD_BIN, [path], { maxBuffer: 32 * 1024 * 1024, timeout: 180_000, env: anymdEnv() }, (error, stdout, stderr) => {
+			if (error && !stdout) {
+				const message = String(stderr || error.message).trim().split("\n")[0] ?? "";
+				const hint = /ENOENT/.test(String(error.message))
+					? "anymd not installed — run `npm i -g @sylphx/anymd`"
+					: `anymd failed: ${message.slice(0, 200)}`;
+				reject(new Error(hint));
+				return;
+			}
+			resolvePromise(stdout);
+		});
+	});
+	const clean = text.replace(/\u0000/g, "").trim();
+	if (!clean) throw new Error("anymd produced no text (scanned file? try OCR)");
+	// A real PDF yields thousands of characters; a near-empty result means a broken
+	// download or an image-only page whose OCR failed, so let pdftotext take over.
+	if (clean.length < 400 && readFileSync(path).subarray(0, 5).toString("latin1") === "%PDF-")
+		throw new Error(`anymd extracted only ${clean.length} chars from this PDF`);
+	return clean;
+}
+
 async function anymdToText(url: string, signal?: AbortSignal): Promise<Page> {
 	const path = await downloadToTemp(url, signal);
 	try {
-		const text = await new Promise<string>((resolve, reject) => {
-			execFile(ANYMD_BIN, [path], { maxBuffer: 32 * 1024 * 1024, timeout: 180_000, env: anymdEnv() }, (error, stdout, stderr) => {
-				if (error && !stdout) {
-					const message = String(stderr || error.message).trim().split("\n")[0] ?? "";
-					const hint = /ENOENT/.test(String(error.message))
-						? "anymd not installed — run `npm i -g @sylphx/anymd`"
-						: `anymd failed: ${message.slice(0, 200)}`;
-					reject(new Error(hint));
-					return;
-				}
-				resolve(stdout);
-			});
-		});
-		const clean = text.replace(/\u0000/g, "").trim();
-		if (!clean) throw new Error("anymd produced no text (scanned file? try OCR)");
-		// A real PDF yields thousands of characters; a near-empty result means a broken
-		// download or an image-only page whose OCR failed, so let pdftotext take over.
-		if (clean.length < 400 && readFileSync(path).subarray(0, 5).toString("latin1") === "%PDF-")
-			throw new Error(`anymd extracted only ${clean.length} chars from this PDF`);
-		return { url, title: basename(new URL(url).pathname) || url, content: clean, source: "anymd" };
+		return { url, title: basename(new URL(url).pathname) || url, content: await execAnymd(path), source: "anymd" };
 	} finally {
 		try {
 			unlinkSync(path);
@@ -1009,29 +1340,33 @@ async function anymdToText(url: string, signal?: AbortSignal): Promise<Page> {
 }
 
 /** pdftotext: fast plain-text extraction, the fallback when anymd is missing or fails. */
+async function execPdftotext(path: string): Promise<string> {
+	const text = await new Promise<string>((resolvePromise, reject) => {
+		execFile(
+			"pdftotext",
+			["-layout", "-enc", "UTF-8", path, "-"],
+			{ maxBuffer: 64 * 1024 * 1024, timeout: 60_000 },
+			(error, stdout) => {
+				if (error && !stdout) {
+					const hint = /ENOENT/.test(String(error.message))
+						? "pdftotext not found — run `brew install poppler`"
+						: `pdftotext failed: ${error.message}`;
+					reject(new Error(hint));
+					return;
+				}
+				resolvePromise(stdout);
+			},
+		);
+	});
+	const clean = text.replace(/\u0000/g, "").trim();
+	if (!clean) throw new Error("pdftotext produced no text (scanned PDF? try mutool / OCR)");
+	return clean;
+}
+
 async function pdfToText(url: string, signal?: AbortSignal): Promise<Page> {
 	const temp = await downloadToTemp(url, signal);
 	try {
-		const text = await new Promise<string>((resolve, reject) => {
-			execFile(
-				"pdftotext",
-				["-layout", "-enc", "UTF-8", temp, "-"],
-				{ maxBuffer: 64 * 1024 * 1024, timeout: 60_000 },
-				(error, stdout) => {
-					if (error && !stdout) {
-						const hint = /ENOENT/.test(String(error.message))
-							? "pdftotext not found — run `brew install poppler`"
-							: `pdftotext failed: ${error.message}`;
-						reject(new Error(hint));
-						return;
-					}
-					resolve(stdout);
-				},
-			);
-		});
-		const clean = text.replace(/\u0000/g, "").trim();
-		if (!clean) throw new Error("pdftotext produced no text (scanned PDF? try mutool / OCR)");
-		return { url, title: basename(new URL(url).pathname) || url, content: clean, source: "pdftotext" };
+		return { url, title: basename(new URL(url).pathname) || url, content: await execPdftotext(temp), source: "pdftotext" };
 	} finally {
 		try {
 			unlinkSync(temp);
@@ -1039,6 +1374,22 @@ async function pdfToText(url: string, signal?: AbortSignal): Promise<Page> {
 			// temp file already gone
 		}
 	}
+}
+
+/** Local document: the same anymd → pdftotext ladder, minus the download. */
+async function localToText(path: string): Promise<Page> {
+	const title = basename(path);
+	const attempts: Array<[string, () => Promise<string>]> = [["anymd", () => execAnymd(path)]];
+	if (/\.pdf$/i.test(path)) attempts.push(["pdftotext", () => execPdftotext(path)]);
+	const errors: string[] = [];
+	for (const [name, run] of attempts) {
+		try {
+			return { url: path, title, content: await run(), source: name === "anymd" ? "anymd" : "pdftotext", note: "local file, never uploaded" };
+		} catch (error) {
+			errors.push(`${name}: ${error instanceof Error ? error.message : String(error)}`);
+		}
+	}
+	throw new Error(`Cannot read local file ${path}\n  ${errors.join("\n  ")}`);
 }
 
 const getSearchContent = defineTool({
