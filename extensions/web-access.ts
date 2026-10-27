@@ -506,7 +506,31 @@ function composeDeepSeekQuery(query: string, domainFilter: string[], recencyFilt
 	return parts.join(" ").replace(/\s+/g, " ").trim();
 }
 
-type Route = "deepseek" | "exa";
+/** DeepSeek rejects a query longer than 128 chars with a 400. Without an Exa key there is
+ *  nothing to fall back to, so the query is trimmed here instead of costing the model a
+ *  wasted round trip: query words go first, then the least load-bearing operators. */
+const TRIM_KEEP_OPERATORS = /^(site:|-site:)/i;
+
+function trimToLimit(composed: string, limit: number): { query: string; dropped: string[] } {
+	if (composed.length <= limit) return { query: composed, dropped: [] };
+	const tokens = composed.split(" ").filter(Boolean);
+	const dropped: string[] = [];
+	// 1. shed query words from the end, never a leading operator.
+	for (let i = tokens.length - 1; i >= 0 && tokens.join(" ").length > limit; i--) {
+		if (TRIM_KEEP_OPERATORS.test(tokens[i] as string)) continue;
+		dropped.unshift(tokens[i] as string);
+		tokens.splice(i, 1);
+	}
+	// 2. still too long: date filters are the cheapest thing left to lose.
+	for (let i = tokens.length - 1; i > 0 && tokens.join(" ").length > limit; i--) {
+		if (!/^(after|before):/i.test(tokens[i] as string)) continue;
+		dropped.push(tokens[i] as string);
+		tokens.splice(i, 1);
+	}
+	return { query: tokens.join(" ").slice(0, limit), dropped };
+}
+
+type Route = "deepseek" | "exa" | "keyless";
 
 function pickRoute(query: string, provider: string | undefined, hasExa: boolean): { route: Route; reason: string } {
 	const forced = (provider ?? "auto").toLowerCase();
@@ -516,7 +540,85 @@ function pickRoute(query: string, provider: string | undefined, hasExa: boolean)
 		return { route: "exa", reason: "forced" };
 	}
 	if (hasExa && BLIND_SPOT.test(query)) return { route: "exa", reason: "domain outside DeepSeek's index" };
+	// Without an Exa key these platforms are otherwise unreachable, so do not spend a
+	// DeepSeek call on an index that is known to be thin there.
+	if (!hasExa && BLIND_SPOT.test(query)) return { route: "keyless", reason: "domain outside DeepSeek's index, no Exa key → keyless fallback" };
 	return { route: "deepseek", reason: "default" };
+}
+
+// --------------------------------------------------------- keyless fallback
+/** Most Pi users only have a DeepSeek key. These endpoints need no key at all and cover
+ *  the platforms DeepSeek's index is blind to, plus a general Bing fallback. */
+async function sov2exHits(query: string, signal?: AbortSignal): Promise<Hit[]> {
+	const url = `https://www.sov2ex.com/api/search?q=${encodeURIComponent(query)}&size=8`;
+	const data = await requestJson(url, { headers: { "User-Agent": BROWSER_UA } }, 12_000, signal);
+	const list: unknown[] = Array.isArray(data?.hits) ? data.hits : [];
+	const hits: Hit[] = [];
+	for (const raw of list) {
+		const source = (raw as any)?._source;
+		const id = String((raw as any)?._id ?? "");
+		const content = stripTags(str(source?.content_rendered));
+		if (!id || content.length < 80) continue;
+		hits.push({
+			title: str(source?.title) || `v2ex /t/${id}`,
+			url: `https://www.v2ex.com/t/${id}`,
+			content,
+			date: str(source?.created)?.slice(0, 10) || undefined,
+			siteName: "V2EX",
+		});
+	}
+	return hits;
+}
+
+/** A search-results page through the reader proxy: one hit whose text is the listing. */
+async function readerSearch(label: string, target: string, query: string, signal?: AbortSignal): Promise<Hit[]> {
+	const page = await jinaReader(target, signal);
+	return [{ title: `${label} · ${query}`, url: target, content: page.content, siteName: label }];
+}
+
+/** A blind-spot query without an Exa key: the keyless engine reaches the platform, DeepSeek
+ *  still has the surrounding discussion. Run both and merge instead of picking one — the
+ *  platform listing is what was asked for, DeepSeek's hits are the context around it. */
+async function mergedBlindSpot(
+	query: string,
+	effective: string,
+	numResults: number,
+	signal?: AbortSignal,
+): Promise<{ label: string; hits: Hit[] }> {
+	const [keyless, deepseek] = await Promise.allSettled([keylessSearch(query, signal), dsSearch(effective, numResults, signal)]);
+	const keylessResult = keyless.status === "fulfilled" ? keyless.value : undefined;
+	const hits: Hit[] = [];
+	const seen = new Set<string>();
+	let keylessUsed = 0;
+	for (const hit of [...(keylessResult?.hits ?? []), ...(deepseek.status === "fulfilled" ? deepseek.value : [])]) {
+		const key = urlKey(hit.url);
+		if (seen.has(key)) continue;
+		// A keyless listing only earns a slot when it actually shows the listing: a login wall
+		// or an image dump wastes the budget that DeepSeek's real articles could use.
+		if (keylessResult?.hits.includes(hit)) {
+			const prose = proseOnly(hit.content ?? "");
+			if (looksLikeWall(prose) || prose.length < 600) continue;
+			hit.content = prose;
+			keylessUsed += 1;
+		}
+		if ((hit.content?.length ?? 0) < 120) continue;
+		seen.add(key);
+		hits.push(hit);
+	}
+	const label = !keylessResult ? "deepseek" : keylessUsed > 0 ? `${keylessResult.label}+deepseek` : `deepseek (${keylessResult.label} listing needed a login)`;
+	return { label, hits: hits.slice(0, numResults) };
+}
+
+async function keylessSearch(query: string, signal?: AbortSignal): Promise<{ label: string; hits: Hit[] }> {
+	const q = encodeURIComponent(query);
+	if (/v2ex/i.test(query)) return { label: "sov2ex", hits: await sov2exHits(query, signal) };
+	if (/weixin|公众号|微信/i.test(query))
+		return { label: "sogou-weixin", hits: await readerSearch("公众号", `https://weixin.sogou.com/weixin?type=2&query=${q}`, query, signal) };
+	if (/xiaohongshu|小红书/i.test(query))
+		return { label: "xiaohongshu", hits: await readerSearch("小红书", `https://www.xiaohongshu.com/search_result?keyword=${q}`, query, signal) };
+	if (/youtube|youtu\.be/i.test(query))
+		return { label: "youtube", hits: await readerSearch("YouTube", `https://www.youtube.com/results?search_query=${q}`, query, signal) };
+	return { label: "bing", hits: await readerSearch("Bing", `https://www.bing.com/search?q=${q}`, query, signal) };
 }
 
 // ------------------------------------------------------------------- cache
@@ -616,15 +718,19 @@ function renderHits(hits: Hit[], contentChars: number, totalBudget: number): { b
 	const lines: string[] = [];
 	let budget = totalBudget;
 	let index = 0;
+	// Reserve a floor for every result still to come: otherwise one long first hit eats the
+	// whole budget and results 3-5 arrive as bare titles, forcing a second call for them.
+	const floor = hits.length > 1 ? Math.min(contentChars, Math.max(150, Math.floor(totalBudget / hits.length / 2))) : 0;
 	for (const hit of hits) {
 		index += 1;
+		const remaining = hits.length - index;
 		const meta: string[] = [];
 		if (hit.authority !== undefined) meta.push(`authority ${hit.authority}/4`);
 		if (hit.rerank !== undefined) meta.push(`rerank ${hit.rerank.toFixed(2)}`);
 		if (hit.date) meta.push(hit.date.slice(0, 10));
 		if (hit.siteName) meta.push(hit.siteName);
 		lines.push(`${index}. ${hit.title}\n   ${hit.url}${meta.length ? `\n   ${meta.join(" · ")}` : ""}`);
-		const take = Math.max(0, Math.min(contentChars, budget));
+		const take = Math.max(0, Math.min(contentChars, budget - floor * remaining));
 		const text = hit.content || hit.snippet || "";
 		if (take > 0 && text) {
 			const shown = truncate(text, take);
@@ -643,10 +749,10 @@ const webSearch = defineTool({
 	promptSnippet: "Search the web; each hit returns its page text, not a snippet",
 	promptGuidelines: [
 		"Never fetch_content a URL you just got from web_search — its text is already in the reply; use get_search_content for the parts that were truncated.",
-		"Filters compile into operators, so keep queries short: the compiled string must stay under 128 chars.",
+		"Filters compile into operators; a compiled query over 128 chars is trimmed automatically, so prefer dropping filters over dropping the question.",
 	],
 	description:
-		"Search the web and get the extracted page text of every hit in the same call. Routes 公众号/小红书/YouTube/V2EX to Exa automatically. Returns a responseId for get_search_content.",
+		"Search the web and get the extracted page text of every hit in the same call. Routes 公众号/小红书/YouTube/V2EX to Exa, or to a keyless endpoint when no Exa key is set. Returns a responseId for get_search_content.",
 	parameters: Type.Object({
 		query: Type.Optional(Type.String({ description: 'Query; operators ok: site:, -site:, "…", lang:zh, after:YYYY-MM-DD.' })),
 		queries: Type.Optional(Type.Array(Type.String(), { description: "Up to 3 variants, searched in parallel.", maxItems: 3 })),
@@ -688,24 +794,40 @@ const webSearch = defineTool({
 			let hits: Hit[] = [];
 			const composed = composeDeepSeekQuery(query, domainFilter, params.recencyFilter);
 			try {
+				let effective = composed;
 				if (route === "deepseek" && composed.length > DS_QUERY_LIMIT) {
-					// Filters pushed the query past the hard 128-char cap — Exa has no such limit.
 					if (hasExa && (params.provider ?? "auto") === "auto") {
+						// Exa has no length cap, so the full query survives there.
 						route = "exa";
 						note = `query+operators = ${composed.length} chars > ${DS_QUERY_LIMIT}, sent to Exa`;
 					} else {
-						throw new Error(
-							`Query with compiled filters is ${composed.length} chars; DeepSeek's hard limit is ${DS_QUERY_LIMIT}. ` +
-								`Shorten the query, drop domainFilter/recencyFilter, or pass provider "exa".\nComposed: ${composed}`,
-						);
+						// No Exa: trim instead of failing — a thrown error costs the model a retry loop.
+						const trimmed = trimToLimit(composed, DS_QUERY_LIMIT);
+						effective = trimmed.query;
+						note = `auto-trimmed ${composed.length}→${effective.length} chars (dropped: ${trimmed.dropped.join(" ") || "none"})`;
 					}
 				}
-				if (route === "deepseek") {
-					hits = await dsSearch(composed, numResults, signal);
+				if (route === "keyless") {
+					const fallback = await mergedBlindSpot(query, effective, numResults, signal);
+					hits = fallback.hits;
+					note = `${note} → ${fallback.label}`;
+					if (hits.length === 0) {
+						route = "deepseek";
+						note = `${note} returned nothing, retried on DeepSeek`;
+						hits = await dsSearch(effective, numResults, signal);
+					}
+				} else if (route === "deepseek") {
+					hits = await dsSearch(effective, numResults, signal);
 					if (hits.length === 0 && hasExa && (params.provider ?? "auto") === "auto") {
 						route = "exa";
 						note = "deepseek returned 0 results, retried with Exa";
 						hits = await exaSearch(query, { numResults, contentChars, domainFilter, recencyFilter: params.recencyFilter, category: params.category }, signal);
+					} else if (hits.length === 0 && !hasExa && (params.provider ?? "auto") === "auto") {
+						// Last resort without an Exa key: a keyless engine still answers something.
+						route = "keyless";
+						const fallback = await keylessSearch(query, signal);
+						hits = fallback.hits;
+						note = `deepseek returned 0 results, retried via ${fallback.label} (no Exa key)`;
 					}
 				} else {
 					hits = await exaSearch(query, { numResults, contentChars, domainFilter, recencyFilter: params.recencyFilter, category: params.category }, signal);
@@ -882,7 +1004,7 @@ function looksLikePath(input: string): boolean {
 
 /** Markers that mean "this text is a challenge page, not the article". */
 const WALL_MARKERS =
-	/安全验证|人机验证|环境异常|请开启JavaScript|Just a moment|Enable JavaScript and cookies|Access Denied|Attention Required|Verify you are human|cf-browser-verification|unusual traffic|captcha/i;
+	/安全验证|人机验证|环境异常|请开启JavaScript|Just a moment|Enable JavaScript and cookies|Access Denied|Attention Required|Verify you are human|cf-browser-verification|unusual traffic|captcha|登录后查看|登录后继续|扫码登录|请先登录|Log in to continue|Sign in to continue/i;
 const MIN_PAGE_CHARS = 120;
 
 function looksLikeWall(text: string): boolean {
@@ -901,6 +1023,23 @@ function stripReaderHeader(raw: string): { title: string; text: string } {
 		if (match[1] === "Title") title = match[2]?.trim() ?? "";
 	}
 	return { title, text: lines.slice(index).join("\n").trim() };
+}
+
+/** What a reader-rendered *search listing* leaves behind: link clutter, lazy images, image
+ *  OCR dumps. Count only the prose so that "1 useful line + 6 KB of noise" is not a hit. */
+function proseOnly(text: string): string {
+	return text
+		.split("\n")
+		.filter((line) => {
+			const t = line.trim();
+			if (!t) return true;
+			if (/^!\[.*\]\(.*\)$/.test(t)) return false;
+			if (/^(URL Source|Markdown Content|Warning):/.test(t)) return false;
+			if (/^https?:\/\/\S+$/.test(t)) return false;
+			return true;
+		})
+		.join("\n")
+		.trim();
 }
 
 /** r.jina.ai renders the page server-side and slips past a lot of paywalls (FT, Bloomberg).
