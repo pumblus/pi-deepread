@@ -233,7 +233,7 @@ A month after release the extension had 273 downloads a month with no promotion.
 | A page that only renders in a browser | 12 s timeout, then failure | 2.8 s, 53 KB | The extractor was fine; the fetch was wrong |
 | arXiv `abs` page | 6,436 ms | 804 ms | Try the HTML `/html/` version first when it exists |
 | arXiv paper with no HTML version | 5,955 ms | 273 ms | Stop trying when the paper predates arXiv HTML |
-| Six concurrent fetches | 9,314 ms | 1,848 ms | Per-host scheduling instead of one global ceiling of 3 |
+| Six concurrent fetches | 9,314 ms | 2,727 ms | Per-host scheduling instead of one global ceiling of 3 (waiting on the index fallback unconditionally would cost 31,900 ms) |
 | Re-fetching the same URL | 7,042 ms | 1 ms | In-session hot cache |
 | Local PDF for the agent | Failed with "Blocked internal address" | 143 ms of extracted text | A path is a source, not a URL |
 | Wikipedia markdown | 105 KB with 4 junk lines | 100 KB with 1 | Chrome stripping scoped to `article`/`main` |

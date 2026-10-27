@@ -235,7 +235,7 @@ exec "$REAL" -l "${ANYMD_TESS_LANGS:-chi_sim+eng}" "$@"
 | 只能浏览器渲染的页面 | 12 s 超时后失败 | 2.8 s，53 KB | 解析器没问题，取页方式错了 |
 | arXiv `abs` 页 | 6,436 ms | 804 ms | 有 `/html/` 版就先试 HTML |
 | 没有 HTML 版的 arXiv 论文 | 5,955 ms | 273 ms | 先判断年代，不再白白试一次 |
-| 6 个并发抓取 | 9,314 ms | 1,848 ms | 按域名调度，而不是全局 3 并发 |
+| 6 个并发抓取 | 9,314 ms | 2,727 ms | 按域名调度，而不是全局 3 并发（无条件等索引兜底会变成 31,900 ms） |
 | 重复抓同一 URL | 7,042 ms | 1 ms | 会话内热缓存 |
 | 交给 agent 的本地 PDF | “Blocked internal address” 报错 | 143 ms 返回正文 | 本地路径是资源，不是 URL |
 | 维基百科正文 | 105 KB + 4 行垃圾 | 100 KB + 1 行 | 只在 `article`/`main` 里剥壳 |
