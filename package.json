@@ -1,7 +1,7 @@
 {
   "name": "pi-deepread",
   "version": "0.2.0",
-  "description": "Full-text web search and document reading for Pi: DeepSeek need_content search, Exa fallback for 公众号/YouTube/V2EX, and local anymd conversion for PDF/Office/EPUB/images.",
+  "description": "Full-text web search and document reading for Pi — 3 tools, under 1k tokens of prompt surface. DeepSeek need_content search, keyless + Exa fallback, local anymd conversion.",
   "keywords": [
     "pi-package",
     "pi",

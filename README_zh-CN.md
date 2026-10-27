@@ -2,13 +2,13 @@
 
 [English](README.md) | 简体中文
 
-面向 [Pi](https://pi.dev) 的轻量网页搜索与本地文档读取扩展。单文件实现，注册 3 个工具，不堆砌服务商。
+面向 [Pi](https://pi.dev) 的轻量网页搜索与本地文档读取扩展。注册 3 个工具，常驻提示面**不到 1k token**，单文件实现，不堆砌服务商。
 
 - **`web_search`** — 基于 DeepSeek `/v1/tools/search`，强制开启 `need_content: true`。每次搜索直接返回提取好的**整页正文**，而不是短短的摘要片段。
 - **`fetch_content`** — 网页内容先走 DeepSeek `/v1/tools/fetch`；遇到付费墙、反爬墙时再回退到阅读代理与 Wayback 快照。本地文档（PDF、Office、EPUB、图片、音频等）通过 `anymd` / `pdftotext` 在本机转换，**直接传一个路径即可，完全不上传**任何内容。
 - **`get_search_content`** — 搜索和抓取的内容按 `responseId` 缓存在本地磁盘。支持分页读取，或通过 `findText` 快速检索正文段落。
 
-常规搜索由 DeepSeek 负责（单次调用约 0.005 元）。Exa 仅作为可选后备，用于覆盖 DeepSeek 索引较弱的盲区（微信公众号、小红书、V2EX、YouTube 等）或主接口报错兜底 —— 没配 Exa 时这些平台会转走免密钥通道，而不是直接失败。
+常规搜索由 DeepSeek 负责（单次调用约 0.005 元）。Exa 仅作为可选后备，用于覆盖 DeepSeek 索引较弱的盲区（微信公众号、小红书、V2EX、YouTube 等）或主接口报错兜底 —— 没配 Exa 时这些平台会转走免密钥通道，**但建议申请一个 Exa Key，在公众号 / 小红书 / V2EX / YouTube 上覆盖度与速度都会明显更好**。
 
 ## 安装
 
@@ -39,7 +39,7 @@ pi -e /path/to/pi-deepread
 2. 环境变量 `DEEPSEEK_API_KEY`
 3. Pi 原生 `auth.json` 中的 `deepseek` 配置
 
-Exa 仅作为可选后备，可通过同名配置文件中的 `exaApiKey` 或环境变量 `EXA_API_KEY` 设置。
+Exa 仅作为可选后备（盲区平台、空结果、主接口报错），可通过同名配置文件中的 `exaApiKey` 或环境变量 `EXA_API_KEY` 设置。没有 Key 也能用免密钥通道跑通，但**在公众号 / 小红书 / V2EX / YouTube 上，自备 Key 的覆盖度与速度明显更好，建议申请一个**。
 
 配置文件示例（`~/.pi/agent/web-search.json`）：
 
@@ -90,6 +90,7 @@ brew install tesseract tesseract-lang
 | `need_content: true`（本扩展启用） | 单条 3.7k–12.6k 字 | 直接获取整页提取文本，调用单价同为 0.005 元 |
 | 抓取并发（6 个不同域名） | 9.31 秒 → **1.85 秒** | 全局 3 并发 vs 按域名调度 |
 | 同一个 URL 抓两次 | 7.04 秒 → **1 毫秒** | 会话内热缓存 |
+| 6 条结果里重复站点 | 平均 1–3 个重复域名 | 多取 2 条再去重（同 URL / 同站超 2 条 / 同标题通讯稿），槽位不减少 |
 | arXiv `abs` 页 | 6.44 秒 → **0.80 秒** | 有 HTML 版时优先用 `/html/` |
 | 付费墙页面（6 个站点） | 0/6 → **5/6** 拿到正文 | 阅读代理与 Wayback 并行竞速 |
 | arXiv 论文（15 页） | anymd：4.1 万字，26 个标题，146 行表格（耗时 0.22s） | pdftotext：5.9 万字，0 标题，双栏排版错乱（耗时 0.09s） |
@@ -101,7 +102,7 @@ brew install tesseract tesseract-lang
 
 - **128 字符限制**：DeepSeek 会把 `domainFilter` 和 `recencyFilter` 编译后的 `site:` 和 `after:` 算子字符算进总长度。编译后超限的查询会被**自动截断**（先丢过滤算子，再丢尾部词），并在结果里说明丢了什么，而不是直接报错。
 - **搜索盲区**：微信公众号、小红书和部分 V2EX 内容不在 DeepSeek 索引中；YouTube 链接常解析到 `music.youtube.com`。配置 Exa key 时会自动转由 Exa 搜索；没有 Exa key 时改走免密钥通道（`sov2ex`、搜狗、阅读代理），与 DeepSeek 自身结果合并；如果拿回来的只是登录墙，就丢弃该条而不是塞给模型。
-- **付费墙与反爬墙**：`fetch_content` 依次尝试 DeepSeek → 直连 HTTP → （并行）阅读代理与 Wayback → 搜索索引。只能登录才能看的页面就返回墙，或者什么都不返回，不会假装拿到了内容。
+- **付费墙与反爬墙**：`fetch_content` 依次尝试 DeepSeek → 直连 HTTP → （并行）阅读代理与 Wayback → 搜索索引。判定“墙”不只看关键词：没有长正文行、过半是导航/登录/页脚行的短页面同样算墙（实测拦下过 123 字符的微博 JS 壳）。只能登录才能看的页面就返回墙，或者什么都不返回，不会假装拿到了内容。
 - **本地缓存**：搜索与抓取内容保存在 `<agent dir>/cache/web/`，每小时自动清理（最长保留 7 天，最多 200 个文件，上限 64 MB）。
 - **状态排查**：在 Pi 中执行 `/web-status` 命令，可查看当前生效的 API 密钥、路由策略、超时时间、OCR shim 检测状态及缓存占用。
 

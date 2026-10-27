@@ -239,6 +239,8 @@ A month after release the extension had 273 downloads a month with no promotion.
 | Wikipedia markdown | 105 KB with 4 junk lines | 100 KB with 1 | Chrome stripping scoped to `article`/`main` |
 | A 163-char query with filters | Hard error | 617 ms, results | Trim the query instead of failing it |
 | 5 hits × 6,000 chars | 3 of 5 hits carried text | 5 of 5 | Reserve a per-hit floor in the budget |
+| Duplicate sites in a 6-hit answer | 1–3 repeated hosts | 0–1, slot count unchanged | Over-fetch 2 extra, then drop duplicate URLs / 3rd hit per host / identical wire titles |
+| A JS shell as content | 123 chars of Weibo navigation | Recognised as a wall | "No long prose line + mostly chrome" is a better shape test than a keyword list |
 
 Three lessons that were not in the original build log:
 

@@ -542,7 +542,7 @@ function pickRoute(query: string, provider: string | undefined, hasExa: boolean)
 	if (hasExa && BLIND_SPOT.test(query)) return { route: "exa", reason: "domain outside DeepSeek's index" };
 	// Without an Exa key these platforms are otherwise unreachable, so do not spend a
 	// DeepSeek call on an index that is known to be thin there.
-	if (!hasExa && BLIND_SPOT.test(query)) return { route: "keyless", reason: "domain outside DeepSeek's index, no Exa key → keyless fallback" };
+	if (!hasExa && BLIND_SPOT.test(query)) return { route: "keyless", reason: "domain outside DeepSeek's index, no Exa key (a key gives better coverage) → keyless fallback" };
 	return { route: "deepseek", reason: "default" };
 }
 
@@ -793,6 +793,9 @@ const webSearch = defineTool({
 			let note = picked.reason;
 			let hits: Hit[] = [];
 			const composed = composeDeepSeekQuery(query, domainFilter, params.recencyFilter);
+			// Ask for a couple more than needed so result-level dedupe is free: squeezing the
+			// answer set must not shrink it below what the caller asked for.
+			const overFetch = Math.min(10, numResults + (numResults < 9 ? 2 : 0));
 			try {
 				let effective = composed;
 				if (route === "deepseek" && composed.length > DS_QUERY_LIMIT) {
@@ -808,20 +811,20 @@ const webSearch = defineTool({
 					}
 				}
 				if (route === "keyless") {
-					const fallback = await mergedBlindSpot(query, effective, numResults, signal);
+					const fallback = await mergedBlindSpot(query, effective, overFetch, signal);
 					hits = fallback.hits;
 					note = `${note} → ${fallback.label}`;
 					if (hits.length === 0) {
 						route = "deepseek";
 						note = `${note} returned nothing, retried on DeepSeek`;
-						hits = await dsSearch(effective, numResults, signal);
+						hits = await dsSearch(effective, overFetch, signal);
 					}
 				} else if (route === "deepseek") {
-					hits = await dsSearch(effective, numResults, signal);
+					hits = await dsSearch(effective, overFetch, signal);
 					if (hits.length === 0 && hasExa && (params.provider ?? "auto") === "auto") {
 						route = "exa";
 						note = "deepseek returned 0 results, retried with Exa";
-						hits = await exaSearch(query, { numResults, contentChars, domainFilter, recencyFilter: params.recencyFilter, category: params.category }, signal);
+						hits = await exaSearch(query, { numResults: overFetch, contentChars, domainFilter, recencyFilter: params.recencyFilter, category: params.category }, signal);
 					} else if (hits.length === 0 && !hasExa && (params.provider ?? "auto") === "auto") {
 						// Last resort without an Exa key: a keyless engine still answers something.
 						route = "keyless";
@@ -830,7 +833,7 @@ const webSearch = defineTool({
 						note = `deepseek returned 0 results, retried via ${fallback.label} (no Exa key)`;
 					}
 				} else {
-					hits = await exaSearch(query, { numResults, contentChars, domainFilter, recencyFilter: params.recencyFilter, category: params.category }, signal);
+					hits = await exaSearch(query, { numResults: overFetch, contentChars, domainFilter, recencyFilter: params.recencyFilter, category: params.category }, signal);
 				}
 			} catch (error) {
 				const message = error instanceof Error ? error.message : String(error);
@@ -838,7 +841,7 @@ const webSearch = defineTool({
 					route = "exa";
 					note = `deepseek failed (${message.split("\n")[0]?.slice(0, 120)}), retried with Exa`;
 					try {
-						hits = await exaSearch(query, { numResults, contentChars, domainFilter, recencyFilter: params.recencyFilter, category: params.category }, signal);
+						hits = await exaSearch(query, { numResults: overFetch, contentChars, domainFilter, recencyFilter: params.recencyFilter, category: params.category }, signal);
 					} catch (exaError) {
 						const detail = exaError instanceof Error ? exaError.message : String(exaError);
 						throw new Error(`Both engines failed for "${query}"\n- deepseek: ${message}\n- exa: ${detail}`);
@@ -847,6 +850,10 @@ const webSearch = defineTool({
 					throw error;
 				}
 			}
+			const beforeSqueeze = hits.length;
+			hits = squeezeHits(hits, composed);
+			if (hits.length < beforeSqueeze) note = `${note} · dedup -${beforeSqueeze - hits.length}`;
+			if (hits.length > numResults) hits = hits.slice(0, numResults);
 			rememberHits(hits);
 			const elapsed = ((Date.now() - started) / 1000).toFixed(2);
 			return { entry: { query, provider: route, note, hits }, elapsed };
@@ -946,6 +953,64 @@ function urlKey(url: string): string {
 	}
 }
 
+/** Site suffixes and app chrome that differ between two copies of the same article. */
+const TITLE_SUFFIX =
+	/\s*[-–—|·]\s*(v2ex|zhihu|知乎|掘金|juejin|简书|csdn|博客园|cnblogs|toutiao|今日头条|打开 ?app|微信公众平台|the verge|techcrunch|medium|infoq|36氪).*$/i;
+
+/** A title reduced to comparable tokens; CJK is split into bigrams because it has no spaces. */
+function titleTokens(title: string): Set<string> {
+	const cleaned = title
+		.toLowerCase()
+		.replace(TITLE_SUFFIX, "")
+		.replace(/[^\p{L}\p{N}]+/gu, " ")
+		.trim();
+	const tokens = new Set<string>();
+	for (const word of cleaned.split(" ").filter(Boolean)) {
+		if (/[\u4e00-\u9fff]/.test(word) && word.length > 2) {
+			for (let i = 0; i < word.length - 1; i++) tokens.add(word.slice(i, i + 2));
+		} else {
+			tokens.add(word);
+		}
+	}
+	return tokens;
+}
+
+function overlap(a: Set<string>, b: Set<string>): number {
+	if (!a.size || !b.size) return 0;
+	let shared = 0;
+	for (const token of a) if (b.has(token)) shared += 1;
+	return shared / (a.size + b.size - shared);
+}
+
+/** Five results that are one wire story on five sites cost the same tokens as five real
+ *  answers and tell the model far less. Drop duplicate URLs, cap per host (unless the query is
+ *  deliberately site-scoped), and collapse near-identical titles. */
+function squeezeHits(hits: Hit[], query: string): Hit[] {
+	const siteScoped = /site:/i.test(query);
+	const seenUrls = new Set<string>();
+	const perHost = new Map<string, number>();
+	const kept: Hit[] = [];
+	const keptTitles: Set<string>[] = [];
+	for (const hit of hits) {
+		if (!hit.url) continue;
+		const key = urlKey(hit.url);
+		if (seenUrls.has(key)) continue;
+		const host = hostOf(hit.url);
+		if (!siteScoped && (perHost.get(host) ?? 0) >= 2) continue;
+		const tokens = titleTokens(hit.title);
+		if (keptTitles.some((other) => overlap(other, tokens) >= 0.8)) continue;
+		seenUrls.add(key);
+		perHost.set(host, (perHost.get(host) ?? 0) + 1);
+		kept.push(hit);
+		keptTitles.push(tokens);
+	}
+	if (kept.length === hits.length) return hits;
+	// A query with one legitimate answer (a doc page, a paper) must keep its runner-ups even
+	// when they share a host: collapsing to a single hit is worse than a repeated host.
+	if (kept.length < Math.min(2, hits.length)) return hits;
+	return kept;
+}
+
 function rememberHits(hits: Hit[]): void {
 	const cutoff = Date.now() - HOT_TTL_MS;
 	for (const [key, entry] of hotCache) if (entry.at < cutoff) hotCache.delete(key);
@@ -1007,9 +1072,14 @@ const WALL_MARKERS =
 	/安全验证|人机验证|环境异常|请开启JavaScript|Just a moment|Enable JavaScript and cookies|Access Denied|Attention Required|Verify you are human|cf-browser-verification|unusual traffic|captcha|登录后查看|登录后继续|扫码登录|请先登录|Log in to continue|Sign in to continue/i;
 const MIN_PAGE_CHARS = 120;
 
-function looksLikeWall(text: string): boolean {
+export function looksLikeWall(text: string): boolean {
 	const head = text.replace(/\s+/g, " ").trim();
-	return head.length < MIN_PAGE_CHARS || WALL_MARKERS.test(head.slice(0, 400));
+	if (head.length < MIN_PAGE_CHARS) return true;
+	if (WALL_MARKERS.test(head.slice(0, 400))) return true;
+	// A page with no long prose line and a majority of menu/login/footer lines has no article
+	// behind it: a JS app shell and a login gate both look like this, both are useless.
+	const proseLines = text.split("\n").filter((line) => line.trim().length >= 60).length;
+	return head.length < 1500 && proseLines < 3 && chromeRatio(text) > 0.5;
 }
 
 /** r.jina.ai prefixes every response with Title/URL Source/Markdown Content lines. */
@@ -1040,6 +1110,17 @@ function proseOnly(text: string): string {
 		})
 		.join("\n")
 		.trim();
+}
+
+/** Share of a page that is furniture, 0-1. A JS shell or a login gate is almost all furniture. */
+function chromeRatio(text: string): number {
+	const lines = proseOnly(text)
+		.split("\n")
+		.map((line) => line.trim())
+		.filter(Boolean);
+	if (lines.length < 8) return 0;
+	const furniture = lines.filter((line) => CHROME_LINE.test(line) || /^[\p{P}\p{S}]+$/u.test(line)).length;
+	return furniture / lines.length;
 }
 
 /** r.jina.ai renders the page server-side and slips past a lot of paywalls (FT, Bloomberg).
@@ -1123,14 +1204,29 @@ async function unblock(url: string, signal?: AbortSignal): Promise<Page> {
 	// Hard budget: a host that refuses everything must not stall the whole batch.
 	const budget = AbortSignal.timeout(12_000);
 	const scoped = signal ? AbortSignal.any([signal, budget]) : budget;
+	// Both start together; the index is usually the slower of the two, so waiting for it only
+	// happens when the race produced nothing usable.
 	const indexed = indexSubstitute(url, scoped).catch(() => undefined);
+	let raced: Page | undefined;
+	let raceError: unknown;
 	try {
-		return await blockedPass(url, scoped);
+		raced = await blockedPass(url, scoped);
 	} catch (error) {
-		const substitute = await indexed;
-		if (substitute) return substitute;
-		throw error;
+		raceError = error;
 	}
+	// A real article on a blocked host is never 500 chars; a 250-char Wayback stub of a Zhihu
+	// question is a menu. Only a thin or walled race result is worth waiting for the index —
+	// awaiting it unconditionally added ~9 s to every paywalled page that already worked.
+	const floor = 600;
+	if (raced && !looksLikeWall(raced.content) && raced.content.length >= floor) return raced;
+	const substitute = await indexed;
+	const better = substitute && !looksLikeWall(substitute.content) && substitute.content.length > (raced?.content.length ?? 0) * 1.5;
+	if (substitute && better) return substitute;
+	if (raced && !looksLikeWall(raced.content)) return raced;
+	if (substitute && !looksLikeWall(substitute.content)) return substitute;
+	if (raced) return raced;
+	if (substitute) return substitute;
+	throw raceError instanceof Error ? raceError : new Error(String(raceError ?? "blocked pass and index substitute both failed"));
 }
 
 /** Last resort: DeepSeek's index often holds the page the live crawl cannot reach.
@@ -1278,7 +1374,7 @@ const CHROME_BLOCK = /<(nav|aside|footer|header|form|button|select|dialog|iframe
 
 /** A whole line of site furniture. Anchored, so it cannot eat a sentence that starts with a link. */
 const CHROME_LINE =
-	/^(?:home|menu|search|share|subscribe|newsletter|sign in|log in|sign up|register|advertisement|skip to (?:main )?content|accept (?:all|cookies)|cookie (?:policy|settings|preferences)|privacy policy|terms of service|all rights reserved|follow us|back to top|read more|related (?:articles|posts|stories)|table of contents|previous|next|we use cookies\b|this (?:site|website) uses cookies\b)/i;
+	/^(?:home|menu|search|share|subscribe|newsletter|sign in|log in|log out|sign up|register|advertisement|skip to (?:main )?content|accept (?:all|cookies)|cookie (?:policy|settings|preferences)|privacy policy|terms of service|all rights reserved|follow us|back to top|read more|related (?:articles|posts|stories)|table of contents|previous|next|we use cookies\b|this (?:site|website) uses cookies\b|continue reading|登录|注册|首页|消息|动态|我的|更多|关注|推荐|热门|返回|上一页|下一页|阅读原文|查看原文|扫码|下载APP|打开APP|广告|版权声明|免责声明|相关阅读|热门推荐|展开全文|收起)$/i;
 
 function stripTags(fragment: string): string {
 	const body = fragment
