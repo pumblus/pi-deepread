@@ -226,6 +226,8 @@ Two items that used to be on this list came back after measurement — see [Roun
 
 A month after release the extension had 273 downloads a month with no promotion. That was enough reason to stop adding features and start measuring the ones already there. I built `bench/` — a real-API harness that loads the actual extension through Pi's loader, so every number below is a measured call, not an estimate.
 
+Because the harness imports the extension exactly the way Pi does, it needs Pi's own `node_modules` on the path: `ln -s ~/.pi/agent/install/releases/<version>/node_modules node_modules`, then `node bench/prompt-surface.ts` or `node bench/scenarios.ts [p0|p1|p2]`. The symlink is local-only and not tracked.
+
 | What | Before | After | Why it moved |
 | --- | --- | --- | --- |
 | Always-on prompt surface | 5,896 chars / 1,638 tok | 3,494 chars / 971 tok | Behaviour moved out of the system prompt into the tool output |

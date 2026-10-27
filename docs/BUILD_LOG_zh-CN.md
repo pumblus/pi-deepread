@@ -228,6 +228,8 @@ exec "$REAL" -l "${ANYMD_TESS_LANGS:-chi_sim+eng}" "$@"
 
 发布一个月后，在完全没有推广的情况下这包在 Pi 上拿到了 273 次/月的下载。这个数字说明该停下来测已有的功能，而不是继续加新功能。于是写了 `bench/`：通过 Pi 自己的加载器加载真实扩展、打真实 API，下面每个数字都是实测调用，不是估算。
 
+因为基准用的是 Pi 自己的加载方式，需要把 Pi 的 `node_modules` 放到路径上：`ln -s ~/.pi/agent/install/releases/<版本>/node_modules node_modules`，然后 `node bench/prompt-surface.ts` 或 `node bench/scenarios.ts [p0|p1|p2]`。这个软链只在本地，不入库。
+
 | 项目 | 之前 | 之后 | 原因 |
 | --- | --- | --- | --- |
 | 常驻 System Prompt | 5,896 字符 / 1,638 tok | 3,494 字符 / 971 tok | 使用习惯从系统提示移到工具输出 |
