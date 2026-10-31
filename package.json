@@ -1,7 +1,7 @@
 {
   "name": "pi-deepread",
   "version": "0.2.0",
-  "description": "Full-text web search and document reading for Pi — 3 tools, under 1k tokens of prompt surface. DeepSeek need_content search, keyless + Exa fallback, local anymd conversion.",
+  "description": "Full-text web search and document reading for Pi \u2014 3 tools, compact prompt surface. DeepSeek need_content search, keyless + Exa fallback, local anymd conversion.",
   "keywords": [
     "pi-package",
     "pi",
@@ -29,7 +29,8 @@
     "docs/BUILD_LOG_zh-CN.md",
     "README.md",
     "README_zh-CN.md",
-    "LICENSE"
+    "LICENSE",
+    "docs/TESTING.md"
   ],
   "pi": {
     "extensions": [
@@ -42,5 +43,20 @@
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "^1.4.0",
+    "@earendil-works/pi-coding-agent": "^1.4.0",
+    "@types/node": "^26.6.6",
+    "typescript": "^7.0.2"
+  },
+  "type": "module",
+  "scripts": {
+    "test": "node --experimental-strip-types --test tests/*.test.ts",
+    "typecheck": "tsc --noEmit",
+    "check": "npm run typecheck && npm test && node --experimental-strip-types bench/sanitize.ts && npm run bench:prompt",
+    "bench": "node --experimental-strip-types bench/scenarios.ts",
+    "bench:prompt": "node --experimental-strip-types bench/prompt-surface.ts",
+    "test:pdf": "node --experimental-strip-types tests/integration/pdf-smoke.ts"
   }
 }

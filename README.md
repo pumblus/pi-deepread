@@ -2,9 +2,9 @@
 
 English | [简体中文](README_zh-CN.md)
 
-Lightweight web search and document reading for [Pi](https://pi.dev). 3 tools, **under 1k tokens** of always-on prompt surface, single-file extension, no provider bloat.
+Lightweight web search and document reading for [Pi](https://pi.dev). 3 tools, **about 1k estimated tokens** of always-on prompt surface (model-dependent), single-file extension, no provider bloat.
 
-- **`web_search`** — Uses DeepSeek `/v1/tools/search` with `need_content: true`. Every result includes the **full extracted page text**, not a short snippet.
+- **`web_search`** — Uses DeepSeek `/v1/tools/search` with `need_content: true`. Returns extracted text when available and labels full, partial, or summary content. Stored text can be paged without another request; fetch a partial hit only when more detail is needed.
 - **`fetch_content`** — Extracts web pages via DeepSeek `/v1/tools/fetch`, then falls back to a reader proxy and the Wayback Machine when a page is paywalled or blocks bots. Local files (`.pdf`, `.docx`, `.xlsx`, `.epub`, images, audio) are converted on your machine with `anymd` / `pdftotext` — pass a plain path and nothing is uploaded.
 - **`get_search_content`** — Stores results on disk with a `responseId`. Read through them with pagination or jump directly to passages using `findText`.
 
@@ -65,7 +65,7 @@ Local files are converted directly on your machine without uploading anything:
 |---|---|
 | `.pdf`, `.docx`, `.pptx`, `.xlsx`, `.epub`, `.csv` | [anymd](https://github.com/SylphxAI/anymd) → Markdown (headings, tables, captions, OCR) |
 | `.pdf` (when anymd is not installed) | `pdftotext` (plain text fallback) |
-| Images / Audio / Subtitles | anymd (OCR / transcripts) |
+| Images / Audio / Subtitles | anymd (OCR / available metadata or subtitles; speech transcription requires separately configured optional support) |
 | Web pages | DeepSeek `/v1/tools/fetch`, fallback to built-in HTTP reader |
 
 Install the optional local parsers:
@@ -82,7 +82,7 @@ brew install tesseract tesseract-lang
 
 ## Benchmarks
 
-Measured on local hardware:
+Historical measurements on local hardware (not re-run for every change; returned character counts do not by themselves establish content accuracy):
 
 | Benchmark | Result | Notes |
 |---|---|---|
@@ -96,14 +96,14 @@ Measured on local hardware:
 | arXiv paper (15 pages) | anymd: 41k chars, 26 headings, 146 table rows (0.22 s) | `pdftotext`: 59k chars, 0 headings, broken columns (0.09 s) |
 | Always-on prompt surface (3 tools) | 5,896 → **3,494 chars** (~971 tok) | Behaviour lives in tool output, not the system prompt |
 
-Run `node bench/scenarios.ts all` to reproduce (needs real API keys).
+Run `npm run check` for the offline correctness gate. Optional live observations require `WEB_BENCH_LIVE=1 node bench/scenarios.ts all` and may consume API credits. See [testing and coverage](docs/TESTING.md) for fixed fixtures, no-Exa isolation, known-fact checks and remaining integration checks. Historical timings above are not pass criteria.
 
 ## Limits & Design Details
 
-- **128-character query limit**: DeepSeek counts the final query string including `site:` and `after:` filter operators. A compiled query over the limit is trimmed automatically (filters first, then trailing words) and the reply states what was dropped, instead of failing the call.
+- **128-character query limit**: DeepSeek counts the final query string including `site:` and `after:` filter operators. A compiled query over the limit is trimmed automatically (filters first, then Unicode-safe truncation of the question) and the reply states what was dropped, instead of failing the call.
 - **Index blind spots**: WeChat Official Accounts (公众号), Xiaohongshu (小红书), and parts of V2EX are not indexed well by DeepSeek; YouTube links frequently resolve to `music.youtube.com`. With an Exa key these queries route to Exa. Without one they go to a keyless endpoint (`sov2ex`, Sogou, the reader proxy), merged with DeepSeek's own hits, and listings that turn out to be login walls are dropped rather than passed to the model.
 - **Paywalls and bot walls**: `fetch_content` tries DeepSeek, then a direct HTTP fetch, then (in parallel) a reader proxy and the Wayback Machine, and finally the search index. "A wall" is not only keyword matching: a short page with no long prose line and a majority of nav/login/footer lines counts too (it caught a 123-char Weibo JS shell that the length check alone let through). A page that is only available behind a wall returns the wall, or nothing — it does not pretend.
-- **Local cache**: Search and fetch results are cached in `<agent dir>/cache/web/`. Automatically pruned every hour (retains up to 7 days, 200 files, or 64 MB).
+- **Local cache**: Search and fetch results are cached in `<agent dir>/cache/web/`. Pruned on writes at most once per hour (retains up to 7 days, 200 files, or 64 MB).
 - **Status check**: Run `/web-status` inside Pi to inspect resolved API keys, active routing, timeouts, OCR shim detection, and cache size.
 
 ## Development
@@ -124,3 +124,7 @@ This project was inspired by [@Arcadia_Bao](https://x.com/Arcadia_Bao/article/21
 ## License
 
 [MIT](LICENSE) © Eric Zhou
+
+### Reading accuracy
+
+Search summaries and Exa excerpts are not reused as complete pages. Successful full reads are reused within the session. Archived copies retain their snapshot URL; an unrelated indexed article is not substituted for the requested page. Audio/video conversion may return metadata or existing subtitles: automatic speech transcription is not requested. Conversion tools remain optional and local.

@@ -1,5 +1,5 @@
-/** Measure the model-facing prompt surface this extension adds to every Pi request.
- *  Everything here is paid on EVERY turn, so it is the metric the package gets judged on. */
+/** Measure serialized tool metadata through the registration harness.
+ * Character counts are a regression proxy, not actual Pi request token counts. */
 import { loadTools } from "./lib.ts";
 
 const tools = await loadTools();
@@ -25,7 +25,7 @@ for (const tool of tools.values()) {
 const sum = (pick: (row: Row) => number) => rows.reduce((acc, row) => acc + pick(row), 0);
 const grandTotal = sum((row) => row.total);
 
-console.log("model-facing prompt surface (chars / ~tokens at 3.6 chars per token)\n");
+console.log("serialized tool metadata (chars / estimated tokens at 3.6 chars per token)\n");
 for (const row of rows) {
 	console.log(
 		`${row.tool.padEnd(20)} snippet ${String(row.snippet).padStart(4)} · desc ${String(row.description).padStart(4)} · guides ${String(
@@ -39,3 +39,10 @@ console.log(
 			(r) => r.parameters,
 		)}`,
 );
+
+// Fixed package budget: do not silently increase this to make a regression pass.
+const CHARACTER_BUDGET = 3500;
+if (rows.length !== 3 || grandTotal > CHARACTER_BUDGET) {
+	console.error(`FAIL prompt budget: expected 3 tools and <=${CHARACTER_BUDGET} characters`);
+	process.exitCode = 1;
+} else console.log(`PASS prompt character budget <=${CHARACTER_BUDGET}; token estimate is model-dependent`);
