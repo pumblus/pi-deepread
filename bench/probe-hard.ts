@@ -28,6 +28,6 @@ for (const url of candidates) {
 		continue;
 	}
 	const text = textOf(value);
-	const meta = /(\S+) 字符 · (\S+) · ([0-9.]+)s/.exec(text);
+	const meta = /(\S+) 字符 · (\S+) · (?:(?:full|partial|summary|unknown|extracted) · )?([0-9.]+)s/.exec(text);
 	console.log(`OBS  ${String(ms).padStart(5)}ms ${url} → ${meta ? `${meta[1]} chars via ${meta[2]}` : "?"}`);
 }
