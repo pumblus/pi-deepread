@@ -1,5 +1,7 @@
 # Testing and Verification
 
+English | [简体中文](TESTING_zh-CN.md)
+
 This document covers the test suites, verification procedures, and benchmarks for `pi-deepread`.
 
 The testing strategy is split into three tiers:
