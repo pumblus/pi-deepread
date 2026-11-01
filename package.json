@@ -1,6 +1,6 @@
 {
   "name": "pi-deepread",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Full-text web search and document reading for Pi \u2014 3 tools, compact prompt surface. DeepSeek need_content search, keyless + Exa fallback, local anymd conversion.",
   "keywords": [
     "pi-package",
@@ -30,7 +30,8 @@
     "README.md",
     "README_zh-CN.md",
     "LICENSE",
-    "docs/TESTING.md"
+    "docs/TESTING.md",
+    "docs/TESTING_zh-CN.md"
   ],
   "pi": {
     "extensions": [
