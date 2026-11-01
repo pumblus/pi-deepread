@@ -1,4 +1,4 @@
-/** Shared bench harness: load the extension the way Pi does and capture its tools. */
+/** Bench harness: capture tool registration with a fake API, not Pi’s real loader. */
 export interface LoadedTool {
 	name: string;
 	description?: string;

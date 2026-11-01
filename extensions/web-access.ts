@@ -152,6 +152,27 @@ function fetchTimeoutMs(): number {
 // ------------------------------------------------------------------ helpers
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+function waitFor(ms: number, signal?: AbortSignal): Promise<void> {
+	signal?.throwIfAborted();
+	return new Promise((resolve, reject) => {
+		const done = () => { signal?.removeEventListener("abort", abort); resolve(); };
+		const timer = setTimeout(done, ms);
+		const abort = () => { clearTimeout(timer); signal?.removeEventListener("abort", abort); reject(signal?.reason ?? new Error("Aborted")); };
+		signal?.addEventListener("abort", abort, { once: true });
+	});
+}
+
+function requestBudget(url: string): string {
+	const parsed = new URL(url);
+	return parsed.origin === DS_BASE ? `${parsed.host}${parsed.pathname}` : parsed.host;
+}
+
+function retryDelay(value: string | null, fallback: number): number {
+	if (!value) return fallback;
+	const seconds = Number(value);
+	const delay = Number.isFinite(seconds) ? seconds * 1000 : Date.parse(value) - Date.now();
+	return Number.isFinite(delay) && delay >= 0 ? delay : fallback;
+}
 let counterValue = 0;
 const counter = () => counterValue++;
 const str = (value: unknown): string => (typeof value === "string" ? value.trim() : "");
@@ -229,21 +250,28 @@ async function requestJson(
 	let lastError: unknown;
 	for (let attempt = 0; attempt < 3; attempt++) {
 		try {
-			const res = await paced(url, () => fetch(url, { ...init, signal: combined }));
-			if (res.status === 429) {
-				noteRateLimit(hostOf(url));
+			combined.throwIfAborted();
+			const budget = requestBudget(url);
+			const res = await paced(url, () => {
+				combined.throwIfAborted();
+				return fetch(url, { ...init, signal: combined });
+			}, budget, combined);
+			if (res.status === 429 || res.status === 408 || res.status >= 500) {
+				if (res.status === 429) noteRateLimit(budget);
+				const delay = retryDelay(res.headers.get("retry-after"), 1200 * (attempt + 1));
+				await res.body?.cancel();
 				if (attempt < 2) {
-					await sleep(1200 * (attempt + 1));
+					await waitFor(delay, combined);
 					continue;
 				}
-				throw new Error(`Rate limited (429) by ${new URL(url).host} — retried 3 times`);
+				throw new Error(`HTTP ${res.status} from ${new URL(url).host} — exhausted 3 attempts`);
 			}
 			const text = await res.text();
 			if (!res.ok) {
 				const detail = text.slice(0, 300).replace(/\s+/g, " ");
 				throw new Error(`HTTP ${res.status} from ${new URL(url).host}: ${detail}`);
 			}
-			noteOk(hostOf(url));
+			noteOk(budget);
 			try {
 				return JSON.parse(text);
 			} catch {
@@ -259,7 +287,7 @@ async function requestJson(
 			if (/HTTP \d|Rate limited|Non-JSON/.test(err.message)) throw err;
 			lastError = err;
 			if (attempt < 2 && /fetch failed|ECONNRESET|ETIMEDOUT|socket hang up|ENOTFOUND|EAI_AGAIN/i.test(err.message)) {
-				await sleep(800);
+				await waitFor(800, combined);
 				continue;
 			}
 			throw err;
@@ -307,18 +335,43 @@ function hostOf(url: string): string {
 	}
 }
 
-async function acquire(host: string): Promise<void> {
-	if (globalInflight >= GLOBAL_MAX_INFLIGHT) await new Promise<void>((wake) => globalWaiters.push(wake));
+function waitSlot(waiters: Array<() => void>, signal?: AbortSignal): Promise<void> {
+	signal?.throwIfAborted();
+	return new Promise((resolve, reject) => {
+		const wake = () => { signal?.removeEventListener("abort", abort); resolve(); };
+		const abort = () => {
+			const index = waiters.indexOf(wake);
+			if (index >= 0) waiters.splice(index, 1);
+			signal?.removeEventListener("abort", abort);
+			reject(signal?.reason ?? new Error("Aborted"));
+		};
+		waiters.push(wake);
+		signal?.addEventListener("abort", abort, { once: true });
+	});
+}
+
+async function acquire(host: string, signal?: AbortSignal): Promise<void> {
+	signal?.throwIfAborted();
+	while (globalInflight >= GLOBAL_MAX_INFLIGHT) await waitSlot(globalWaiters, signal);
+	signal?.throwIfAborted();
 	globalInflight++;
 	const state = hostState(host);
-	// Re-checked in a loop: a wake-up can be consumed by an earlier waiter.
-	while (state.inflight >= state.limit) await new Promise<void>((wake) => state.waiters.push(wake));
-	state.inflight++;
-	// Space starts just enough that a burst does not read as a scan.
-	const gap = Math.min(300, Math.max(60, Math.round(fetchGapMs() / 4)));
-	const at = Math.max(Date.now(), state.nextStartAt);
-	state.nextStartAt = at + gap;
-	if (at > Date.now()) await sleep(at - Date.now());
+	let acquiredHost = false;
+	try {
+		while (state.inflight >= state.limit) await waitSlot(state.waiters, signal);
+		signal?.throwIfAborted();
+		state.inflight++;
+		acquiredHost = true;
+		const gap = Math.min(300, Math.max(60, Math.round(fetchGapMs() / 4)));
+		const at = Math.max(Date.now(), state.nextStartAt);
+		state.nextStartAt = at + gap;
+		if (at > Date.now()) await waitFor(at - Date.now(), signal);
+	} catch (error) {
+		if (acquiredHost) { state.inflight--; state.waiters.shift()?.(); }
+		globalInflight--;
+		globalWaiters.shift()?.();
+		throw error;
+	}
 }
 
 function release(host: string): void {
@@ -342,9 +395,9 @@ function noteOk(host: string): void {
 }
 
 /** Every outbound request goes through here. */
-async function paced<T>(url: string, task: () => Promise<T>): Promise<T> {
-	const host = hostOf(url);
-	await acquire(host);
+async function paced<T>(url: string, task: () => Promise<T>, budget?: string, signal?: AbortSignal): Promise<T> {
+	const host = budget ?? hostOf(url);
+	await acquire(host, signal);
 	try {
 		return await task();
 	} finally {
@@ -369,7 +422,11 @@ async function mapLimit<T, R>(items: T[], limit: number, task: (item: T, index: 
 
 // --------------------------------------------------------------- deepseek
 
+type ContentKind = "full" | "partial" | "summary" | "unknown";
+
 interface Hit {
+	contentKind?: ContentKind;
+	contentSource?: string;
 	title: string;
 	url: string;
 	content: string;
@@ -380,7 +437,7 @@ interface Hit {
 	rerank?: number;
 }
 
-function normalizeHits(data: any): Hit[] {
+function normalizeHits(data: any, source: "deepseek" | "exa" = "deepseek"): Hit[] {
 	const list: unknown[] = Array.isArray(data?.results) ? data.results : Array.isArray(data?.data) ? data.data : [];
 	const hits: Hit[] = [];
 	for (const raw of list) {
@@ -388,12 +445,16 @@ function normalizeHits(data: any): Hit[] {
 		const entry = raw as Record<string, any>;
 		const url = str(entry.url) || str(entry.link);
 		if (!url) continue;
-		const content = str(entry.content) || str(entry.summary) || str(entry.text) || "";
+		const body = str(entry.content) || str(entry.text);
+		const content = body || str(entry.summary) || "";
+		const contentKind: ContentKind = !body ? "summary" : source === "exa" || entry.truncated === true || entry.is_truncated === true ? "partial" : "full";
 		const snippet = str(entry.snippet);
 		hits.push({
 			title: str(entry.title) || url,
 			url,
 			content,
+			contentKind,
+			contentSource: `${source}-search`,
 			// DeepSeek returns the same text in `summary` and `snippet`; keeping both doubled
 			// every stored search on disk. Keep the snippet only when it adds something.
 			snippet: snippet && !content.includes(snippet.slice(0, 80)) ? snippet : undefined,
@@ -424,6 +485,8 @@ async function dsSearch(query: string, count: number, signal?: AbortSignal): Pro
 }
 
 interface Page {
+	contentKind?: ContentKind;
+	originalSource?: string;
 	url: string;
 	title: string;
 	content: string;
@@ -431,9 +494,17 @@ interface Page {
 	note?: string;
 }
 
+const targetStarts = new Map<string, number>();
 async function dsFetchPage(url: string, signal?: AbortSignal): Promise<Page> {
 	const key = deepseekKey();
 	if (!key) throw new Error("DeepSeek API key missing (web-search.json: deepseekApiKey, or DEEPSEEK_API_KEY)");
+	// Separate from Search's budget; Fetch also needs conservative per-target pacing.
+	const target = hostOf(url);
+	const now = Date.now();
+	for (const [host, at] of targetStarts) if (at < now) targetStarts.delete(host);
+	const start = Math.max(now, targetStarts.get(target) ?? 0);
+	targetStarts.set(target, start + fetchGapMs());
+	if (start > now) await waitFor(start - now, signal);
 	const data = await requestJson(
 		`${DS_BASE}/v1/tools/fetch`,
 		{
@@ -446,7 +517,7 @@ async function dsFetchPage(url: string, signal?: AbortSignal): Promise<Page> {
 	);
 	const content = str(data?.content);
 	if (!content) throw new Error(`DeepSeek returned no content for ${url}`);
-	return { url, title: str(data?.title) || url, content, source: "deepseek" };
+	return { url, title: str(data?.title) || url, content, source: "deepseek", contentKind: data?.truncated === true || data?.is_truncated === true ? "partial" : "full" };
 }
 
 // -------------------------------------------------------------------- exa
@@ -481,7 +552,7 @@ async function exaSearch(
 		45_000,
 		signal,
 	);
-	return normalizeHits(data);
+	return normalizeHits(data, "exa");
 }
 
 // ------------------------------------------------------- query composition
@@ -506,28 +577,23 @@ function composeDeepSeekQuery(query: string, domainFilter: string[], recencyFilt
 	return parts.join(" ").replace(/\s+/g, " ").trim();
 }
 
-/** DeepSeek rejects a query longer than 128 chars with a 400. Without an Exa key there is
- *  nothing to fall back to, so the query is trimmed here instead of costing the model a
- *  wasted round trip: query words go first, then the least load-bearing operators. */
-const TRIM_KEEP_OPERATORS = /^(site:|-site:)/i;
-
+/** Shed optional filters first; truncate Unicode code points, never a whole CJK query. */
 function trimToLimit(composed: string, limit: number): { query: string; dropped: string[] } {
-	if (composed.length <= limit) return { query: composed, dropped: [] };
-	const tokens = composed.split(" ").filter(Boolean);
+	let query = composed.trim().replace(/\s+/g, " ");
 	const dropped: string[] = [];
-	// 1. shed query words from the end, never a leading operator.
-	for (let i = tokens.length - 1; i >= 0 && tokens.join(" ").length > limit; i--) {
-		if (TRIM_KEEP_OPERATORS.test(tokens[i] as string)) continue;
-		dropped.unshift(tokens[i] as string);
-		tokens.splice(i, 1);
+	const chars = (value: string) => Array.from(value);
+	if (chars(query).length <= limit) return { query, dropped };
+	query = query.replace(/(?:^|\s)(?:-?site|after|before):\S+/gi, (filter) => {
+		dropped.push(filter.trim());
+		return "";
+	}).trim().replace(/\s+/g, " ");
+	if (chars(query).length > limit) {
+		const points = chars(query);
+		dropped.push(points.slice(limit).join(""));
+		query = points.slice(0, limit).join("").trimEnd();
 	}
-	// 2. still too long: date filters are the cheapest thing left to lose.
-	for (let i = tokens.length - 1; i > 0 && tokens.join(" ").length > limit; i--) {
-		if (!/^(after|before):/i.test(tokens[i] as string)) continue;
-		dropped.push(tokens[i] as string);
-		tokens.splice(i, 1);
-	}
-	return { query: tokens.join(" ").slice(0, limit), dropped };
+	if (!query) throw new Error("Query has no searchable text after removing filters");
+	return { query, dropped };
 }
 
 type Route = "deepseek" | "exa" | "keyless";
@@ -696,7 +762,9 @@ function loadStored(id: string): Stored | undefined {
 	const clean = id.trim().replace(/[^\w-]/g, "");
 	if (!clean) return undefined;
 	try {
-		return JSON.parse(readFileSync(join(cacheDir(), `${clean}.json`), "utf8")) as Stored;
+		const path = join(cacheDir(), `${clean}.json`);
+		if (Date.now() - statSync(path).mtimeMs > CACHE_KEEP_DAYS * 86_400_000) return undefined;
+		return JSON.parse(readFileSync(path, "utf8")) as Stored;
 	} catch {
 		return undefined;
 	}
@@ -724,7 +792,7 @@ function renderHits(hits: Hit[], contentChars: number, totalBudget: number): { b
 	for (const hit of hits) {
 		index += 1;
 		const remaining = hits.length - index;
-		const meta: string[] = [];
+		const meta: string[] = [`${hit.contentKind ?? "unknown"} · ${hit.contentSource ?? "search"}`];
 		if (hit.authority !== undefined) meta.push(`authority ${hit.authority}/4`);
 		if (hit.rerank !== undefined) meta.push(`rerank ${hit.rerank.toFixed(2)}`);
 		if (hit.date) meta.push(hit.date.slice(0, 10));
@@ -746,13 +814,13 @@ function renderHits(hits: Hit[], contentChars: number, totalBudget: number): { b
 const webSearch = defineTool({
 	name: "web_search",
 	label: "Web Search",
-	promptSnippet: "Search the web; each hit returns its page text, not a snippet",
+	promptSnippet: "Search the web with page text and content status",
 	promptGuidelines: [
-		"Never fetch_content a URL you just got from web_search — its text is already in the reply; use get_search_content for the parts that were truncated.",
+		"Use get_search_content for stored text; fetch_content can complete hits marked partial or summary when needed.",
 		"Filters compile into operators; a compiled query over 128 chars is trimmed automatically, so prefer dropping filters over dropping the question.",
 	],
 	description:
-		"Search the web and get the extracted page text of every hit in the same call. Routes 公众号/小红书/YouTube/V2EX to Exa, or to a keyless endpoint when no Exa key is set. Returns a responseId for get_search_content.",
+		"Search the web with extracted text when available; results label partial content. Routes 公众号/小红书/YouTube/V2EX to Exa, or to a keyless endpoint when no Exa key is set. Returns a responseId for get_search_content.",
 	parameters: Type.Object({
 		query: Type.Optional(Type.String({ description: 'Query; operators ok: site:, -site:, "…", lang:zh, after:YYYY-MM-DD.' })),
 		queries: Type.Optional(Type.Array(Type.String(), { description: "Up to 3 variants, searched in parallel.", maxItems: 3 })),
@@ -786,7 +854,7 @@ const webSearch = defineTool({
 		// (sequential) to roughly the slowest variant plus one pacing gap.
 		const results = await mapLimit(variants, 3, async (query, index) => {
 			if (signal?.aborted) throw new Error("Aborted");
-			onUpdate?.({ content: [{ type: "text", text: `Searching ${index + 1}/${variants.length}: ${query}` }] });
+			onUpdate?.({ details: {}, content: [{ type: "text", text: `Searching ${index + 1}/${variants.length}: ${query}` }] });
 			const started = Date.now();
 			const picked = pickRoute(query, params.provider, hasExa);
 			let route = picked.route;
@@ -798,7 +866,7 @@ const webSearch = defineTool({
 			const overFetch = Math.min(10, numResults + (numResults < 9 ? 2 : 0));
 			try {
 				let effective = composed;
-				if (route === "deepseek" && composed.length > DS_QUERY_LIMIT) {
+				if (route === "deepseek" && Array.from(composed).length > DS_QUERY_LIMIT) {
 					if (hasExa && (params.provider ?? "auto") === "auto") {
 						// Exa has no length cap, so the full query survives there.
 						route = "exa";
@@ -837,7 +905,7 @@ const webSearch = defineTool({
 				}
 			} catch (error) {
 				const message = error instanceof Error ? error.message : String(error);
-				if (route === "deepseek" && hasExa && (params.provider ?? "auto") === "auto" && !/Aborted/.test(message)) {
+				if (route === "deepseek" && hasExa && (params.provider ?? "auto") === "auto" && !signal?.aborted && !/Aborted/i.test(message)) {
 					route = "exa";
 					note = `deepseek failed (${message.split("\n")[0]?.slice(0, 120)}), retried with Exa`;
 					try {
@@ -885,12 +953,13 @@ const webSearch = defineTool({
 async function fetchOne(url: string, signal?: AbortSignal): Promise<Page> {
 	// A document already on disk: no download, no SSRF check, no network at all.
 	const local = localPathOf(url);
-	if (local) return localToText(local);
+	if (signal?.aborted) throw new Error("Aborted");
+	if (local) return localToText(local, signal);
 	if (looksLikePath(url)) throw new Error(`No such local file: ${url}`);
 
 	// The model often re-fetches a URL it just saw in web_search results — answer from memory.
 	const hot = hotLookup(url);
-	if (hot) return { url: hot.url, title: hot.title, content: hot.content, source: "cache", note: "already crawled by web_search in this session, no new request" };
+	if (hot) return { ...hot, source: "cache", note: `reused ${hot.originalSource ?? "extracted"} text; no new request` };
 
 	const parsed = assertFetchable(url);
 	const namedPdf = /\.pdf$/i.test(parsed.pathname);
@@ -904,9 +973,7 @@ async function fetchOne(url: string, signal?: AbortSignal): Promise<Page> {
 		// arXiv PDFs are typeset twice; the HTML build is a fraction of the bytes and keeps equations.
 		const htmlVersion = arxivHtmlVersion(url);
 		if (htmlVersion) attempts.push(["deepseek", () => dsFetchPage(htmlVersion, signal)]);
-		attempts.push(["anymd", () => anymdToText(url, signal)]);
-		if (namedPdf || !namedDoc) attempts.push(["pdftotext", () => pdfToText(url, signal)]);
-		attempts.push(["http", () => httpToText(url, signal)]);
+		attempts.push(["anymd", () => anymdToText(url, signal, namedPdf || !namedDoc)]);
 	} else {
 		attempts.push(["deepseek", () => dsFetchPage(url, signal)]);
 		attempts.push(["http", () => httpToText(url, signal)]);
@@ -924,8 +991,11 @@ async function fetchOne(url: string, signal?: AbortSignal): Promise<Page> {
 				errors.push(`${name}: only ${num(page.content.length)} chars, looks like a wall or a JS shell`);
 				continue;
 			}
+			if (signal?.aborted) throw new Error("Aborted");
+			rememberPage(page);
 			return page;
 		} catch (error) {
+			if (signal?.aborted) throw new Error("Aborted");
 			errors.push(`${name}: ${error instanceof Error ? error.message : String(error)}`);
 		}
 	}
@@ -940,16 +1010,21 @@ async function fetchOne(url: string, signal?: AbortSignal): Promise<Page> {
 const HOT_MAX = 80;
 const HOT_TTL_MS = 30 * 60_000;
 const HOT_MIN_CHARS = 400;
-const hotCache = new Map<string, { url: string; title: string; content: string; at: number }>();
+const hotCache = new Map<string, Page & { at: number }>();
 
-/** Compare URLs the way a reader would: ignore #anchors, www, trailing slashes and tracking params. */
+/** Preserve resource identity: path/query case, port, scheme, www and slash can matter. */
 function urlKey(url: string): string {
 	try {
 		const parsed = new URL(url);
-		for (const key of [...parsed.searchParams.keys()]) if (/^(utm_|fbclid$|gclid$|spm$|ref$|source$)/i.test(key)) parsed.searchParams.delete(key);
-		return `${parsed.hostname.replace(/^www\./, "")}${parsed.pathname.replace(/\/+$/, "")}${parsed.search}`.toLowerCase();
+		parsed.hash = "";
+		const kept = parsed.search.slice(1).split("&").filter((part) => {
+			try { return !/^(utm_.+|fbclid|gclid)$/i.test(decodeURIComponent(part.split("=")[0])); }
+			catch { return true; }
+		});
+		parsed.search = kept.join("&");
+		return parsed.href;
 	} catch {
-		return url.trim().toLowerCase();
+		return url.trim();
 	}
 }
 
@@ -1007,23 +1082,33 @@ function squeezeHits(hits: Hit[], query: string): Hit[] {
 	if (kept.length === hits.length) return hits;
 	// A query with one legitimate answer (a doc page, a paper) must keep its runner-ups even
 	// when they share a host: collapsing to a single hit is worse than a repeated host.
-	if (kept.length < Math.min(2, hits.length)) return hits;
+	if (kept.length < Math.min(2, hits.length)) {
+		const urls = new Set<string>();
+		return hits.filter((hit) => { const key = urlKey(hit.url); if (urls.has(key)) return false; urls.add(key); return true; });
+	}
 	return kept;
 }
 
-function rememberHits(hits: Hit[]): void {
+function rememberPage(page: Page): void {
+	if (!page.url || !page.content.trim() || page.contentKind === "partial" || page.contentKind === "summary" || page.contentKind === "unknown" || looksLikeWall(page.content)) return;
+	// Related/index/archive copies must retain provenance and never silently replace a live URL.
+	if (page.source === "index" || page.source === "wayback") return;
 	const cutoff = Date.now() - HOT_TTL_MS;
 	for (const [key, entry] of hotCache) if (entry.at < cutoff) hotCache.delete(key);
-	for (const hit of hits) {
-		if (!hit.url || hit.content.length < HOT_MIN_CHARS) continue;
-		const key = urlKey(hit.url);
-		hotCache.delete(key);
-		hotCache.set(key, { url: hit.url, title: hit.title, content: hit.content, at: Date.now() });
-	}
+	const key = urlKey(page.url);
+	hotCache.delete(key);
+	hotCache.set(key, { ...page, contentKind: "full", originalSource: page.originalSource ?? page.source, at: Date.now() });
 	while (hotCache.size > HOT_MAX) hotCache.delete(hotCache.keys().next().value as string);
 }
 
-function hotLookup(url: string): { url: string; title: string; content: string } | undefined {
+function rememberHits(hits: Hit[]): void {
+	for (const hit of hits) {
+		if (hit.contentKind !== "full") continue;
+		rememberPage({ ...hit, source: "deepseek", originalSource: hit.contentSource });
+	}
+}
+
+function hotLookup(url: string): Page | undefined {
 	const key = urlKey(url);
 	const entry = hotCache.get(key);
 	if (!entry) return undefined;
@@ -1031,7 +1116,6 @@ function hotLookup(url: string): { url: string; title: string; content: string }
 		hotCache.delete(key);
 		return undefined;
 	}
-	// Refresh LRU position without changing the timestamp.
 	hotCache.delete(key);
 	hotCache.set(key, entry);
 	return entry;
@@ -1070,11 +1154,13 @@ function looksLikePath(input: string): boolean {
 /** Markers that mean "this text is a challenge page, not the article". */
 const WALL_MARKERS =
 	/安全验证|人机验证|环境异常|请开启JavaScript|Just a moment|Enable JavaScript and cookies|Access Denied|Attention Required|Verify you are human|cf-browser-verification|unusual traffic|captcha|登录后查看|登录后继续|扫码登录|请先登录|Log in to continue|Sign in to continue/i;
-const MIN_PAGE_CHARS = 120;
 
 export function looksLikeWall(text: string): boolean {
 	const head = text.replace(/\s+/g, " ").trim();
-	if (head.length < MIN_PAGE_CHARS) return true;
+	if (!head) return true;
+	const lines = text.split("\n").map((line) => line.trim()).filter(Boolean);
+	const shellLine = /^(?:loading[.!…]*|please (?:enable|turn on) javascript(?: to continue)?[.!]?|enable javascript[.!]?|javascript is required[.!]?|please wait[.!…]*)$/i;
+	if (lines.every((line) => CHROME_LINE.test(line) || shellLine.test(line))) return true;
 	if (WALL_MARKERS.test(head.slice(0, 400))) return true;
 	// A page with no long prose line and a majority of menu/login/footer lines has no article
 	// behind it: a JS app shell and a login gate both look like this, both are useless.
@@ -1134,11 +1220,12 @@ async function jinaReader(url: string, signal?: AbortSignal): Promise<Page> {
 			headers: { Accept: "text/plain", "User-Agent": BROWSER_UA },
 			signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
 		}),
+		undefined, signal,
 	);
 	if (!res.ok) throw new Error(`reader HTTP ${res.status}`);
 	const { title, text } = stripReaderHeader(await res.text());
 	// A reader that hands back a few hundred characters is echoing a login/JS wall.
-	if (text.length < 400 || looksLikeWall(text)) throw new Error(`reader returned a challenge page (${num(text.length)} chars)`);
+	if (looksLikeWall(text)) throw new Error(`reader returned a challenge page (${num(text.length)} chars)`);
 	return { url, title: title || url, content: text, source: "jina" };
 }
 
@@ -1155,6 +1242,7 @@ async function wayback(url: string, signal?: AbortSignal): Promise<Page> {
 				headers: { Accept: "text/html", "User-Agent": BROWSER_UA },
 				signal: combined,
 			}),
+			undefined, signal,
 		);
 		// archive.org rate limits bursts even when the snapshot exists — one paced retry wins it back.
 		if (res.status !== 429 || attempt === 1) break;
@@ -1164,7 +1252,7 @@ async function wayback(url: string, signal?: AbortSignal): Promise<Page> {
 	if (!res?.ok) throw new Error(`archive HTTP ${res?.status ?? "error"}`);
 	const parsed = htmlToText(await res.text());
 	if (looksLikeWall(parsed.text)) throw new Error("archive has no usable snapshot");
-	return { url, title: parsed.title || url, content: parsed.text, source: "wayback" };
+	return { url, title: parsed.title || url, content: parsed.text, source: "wayback", contentKind: "unknown", note: `archived copy, may be outdated: ${res.url || "snapshot date unavailable"}` };
 }
 
 /** Race both unblocking paths and keep whichever answers first with real text. */
@@ -1242,19 +1330,14 @@ async function indexSubstitute(url: string, signal?: AbortSignal): Promise<Page>
 	const hits = await dsSearch(`${slug} site:${parsed.hostname.replace(/^www\./, "")}`, 6, signal);
 	const wanted = urlKey(url);
 	const exact = hits.find((hit) => urlKey(hit.url) === wanted);
-	// A substitute is only honest when it is the same host and shares a real slug token —
-	// otherwise "nearest page" turns into a different story with the same site name.
-	const tokens = slug.split(" ").filter((word) => word.length >= 4);
-	const related = hits.find(
-		(hit) => new URL(hit.url).hostname.replace(/^www\./, "") === parsed.hostname.replace(/^www\./, "") && tokens.some((token) => urlKey(hit.url).includes(token.toLowerCase())),
-	);
-	const winner = exact ?? related;
-	if (!winner || winner.content.length < HOT_MIN_CHARS) throw new Error("no indexed copy of this page");
+	const winner = exact;
+	if (!winner || !winner.content.trim()) throw new Error("no exact indexed copy of this page");
 	return {
 		url: winner.url,
 		title: winner.title,
 		content: winner.content,
 		source: "index",
+		contentKind: winner.contentKind ?? "unknown",
 		note: exact
 			? `${parsed.hostname} refused the live crawl; text comes from DeepSeek's index of the same URL`
 			: `${parsed.hostname} refused the live crawl and has no exact indexed copy; this is the closest indexed page on the same story`,
@@ -1305,7 +1388,7 @@ const fetchContent = defineTool({
 		// batch limit only needs to keep a wide fan-out (20 links) from opening 20 sockets.
 		const outcomes = await mapLimit(urls, 6, async (url, index) => {
 			if (signal?.aborted) throw new Error("Aborted");
-			onUpdate?.({ content: [{ type: "text", text: `Fetching ${index + 1}/${urls.length}: ${url}` }] });
+			onUpdate?.({ details: {}, content: [{ type: "text", text: `Fetching ${index + 1}/${urls.length}: ${url}` }] });
 			const started = Date.now();
 			try {
 				const page = await fetchOne(url, signal);
@@ -1318,7 +1401,7 @@ const fetchContent = defineTool({
 
 		for (const [index, outcome] of outcomes.entries()) {
 			if ("failure" in outcome) {
-				failures.push(outcome.failure);
+				failures.push(outcome.failure ?? "Unknown failure");
 				continue;
 			}
 			const { page, elapsed } = outcome;
@@ -1327,7 +1410,7 @@ const fetchContent = defineTool({
 			const shown = truncate(page.content, take);
 			budget -= Math.min(page.content.length, take);
 			blocks.push(
-				`## [${index + 1}] ${page.title}\n${page.url}\n${num(page.content.length)} 字符 · ${page.source} · ${elapsed.toFixed(2)}s${
+				`## [${index + 1}] ${page.title}\n${page.url}\n${num(page.content.length)} 字符 · ${page.source} · ${page.contentKind ?? "extracted"} · ${elapsed.toFixed(2)}s${
 					page.note ? `\nnote: ${page.note}` : ""
 				}\n\n${shown}`,
 			);
@@ -1341,7 +1424,7 @@ const fetchContent = defineTool({
 		if (failures.length) parts.push(`## 失败 ${failures.length}/${urls.length}\n${failures.join("\n")}`);
 		return {
 			content: [{ type: "text", text: parts.join("\n\n") }],
-			details: { responseId: id, ok: pages.length, failed: failures.length, pages: pages.map((p) => ({ url: p.url, chars: p.content.length, source: p.source })) },
+			details: { responseId: id, ok: pages.length, failed: failures.length, pages: pages.map((p) => ({ url: p.url, chars: p.content.length, source: p.source, contentKind: p.contentKind ?? "extracted", note: p.note })) },
 		};
 	},
 });
@@ -1419,6 +1502,7 @@ async function httpToText(url: string, signal?: AbortSignal): Promise<Page> {
 			headers: { "User-Agent": BROWSER_UA, Accept: "text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.5" },
 			signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
 		}),
+		undefined, signal,
 	);
 	if (!res.ok) throw new Error(`HTTP ${res.status}`);
 	const type = (res.headers.get("content-type") ?? "").toLowerCase();
@@ -1450,6 +1534,7 @@ async function peekKind(url: string, signal?: AbortSignal): Promise<"document" |
 				headers: { Range: "bytes=0-2047", "User-Agent": BROWSER_UA },
 				signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
 			}),
+			undefined, signal,
 		);
 		if (!res.ok && res.status !== 206) {
 			await res.body?.cancel();
@@ -1504,88 +1589,92 @@ const ANYMD_SHIM = ANYMD_SHIM_DIR ? join(ANYMD_SHIM_DIR, "tesseract") : "";
 
 function anymdEnv(): NodeJS.ProcessEnv {
 	const env: NodeJS.ProcessEnv = { ...process.env, ANYMD_TESS_LANGS: process.env.ANYMD_TESS_LANGS ?? "chi_sim+eng" };
-	if (ANYMD_SHIM && existsSync(ANYMD_SHIM)) env.PATH = `${ANYMD_SHIM_DIR}:${process.env.PATH ?? ""}`;
+	if (ANYMD_SHIM && existsSync(ANYMD_SHIM)) env.PATH = `${ANYMD_SHIM_DIR}${process.platform === "win32" ? ";" : ":"}${process.env.PATH ?? ""}`;
 	return env;
 }
 
-/** Download to a temp file. anymd refuses http URLs here (its SSRF guard sees the TUN
- *  fake-IP range 198.18/15), so the extension downloads and anymd only reads local files. */
+function removeTemp(path: string): void {
+	try { unlinkSync(path); } catch { /* Already removed, or never created. */ }
+}
+
+/** Download locally once, enforcing the cap even when Content-Length is missing. */
 async function downloadToTemp(url: string, signal?: AbortSignal): Promise<string> {
+	signal?.throwIfAborted();
 	const parsed = new URL(url);
 	const ext = (parsed.pathname.match(/\.[a-z0-9]{1,5}$/i)?.[0] ?? "").toLowerCase();
 	const timeout = AbortSignal.timeout(fetchTimeoutMs());
 	const combined = signal ? AbortSignal.any([signal, timeout]) : timeout;
-	const res = await paced(url, () => fetch(url, { signal: combined, redirect: "follow", headers: { "User-Agent": BROWSER_UA } }));
-	if (!res.ok) throw new Error(`download failed: HTTP ${res.status}`);
+	const res = await paced(url, () => fetch(url, { signal: combined, redirect: "follow", headers: { "User-Agent": BROWSER_UA } }), undefined, combined);
+	if (!res.ok) {
+		await res.body?.cancel();
+		throw new Error(`download failed: HTTP ${res.status}`);
+	}
 	const declared = Number(res.headers.get("content-length") ?? 0);
-	if (declared && declared > PDF_MAX_BYTES) throw new Error(`file is ${num(declared)} bytes, over the ${num(PDF_MAX_BYTES)}-byte cap`);
+	if (declared && declared > PDF_MAX_BYTES) {
+		await res.body?.cancel();
+		throw new Error(`file is ${num(declared)} bytes, over the ${num(PDF_MAX_BYTES)}-byte cap`);
+	}
 	if (!res.body) throw new Error("download failed: empty body");
-	const path = join(tmpdir(), `wa-${Date.now().toString(36)}-${counter().toString(36)}${ext || ".bin"}`);
-	// Stream to disk instead of buffering: a 30 MB PDF used to sit in the heap (x3 for a batch).
+	const path = join(tmpdir(), `wa-${process.pid}-${Date.now().toString(36)}-${counter().toString(36)}${ext || ".bin"}`);
 	let bytes = 0;
-	await pipeline(
-		Readable.fromWeb(res.body as Parameters<typeof Readable.fromWeb>[0]),
-		async function* (source: AsyncIterable<Uint8Array>) {
-			for await (const chunk of source) {
-				bytes += chunk.byteLength;
-				if (bytes > PDF_MAX_BYTES) throw new Error(`file is over the ${num(PDF_MAX_BYTES)}-byte cap`);
-				yield chunk;
-			}
-		},
-		createWriteStream(path),
-	);
-	return path;
+	try {
+		await pipeline(
+			Readable.fromWeb(res.body as Parameters<typeof Readable.fromWeb>[0]),
+			async function* (source: AsyncIterable<Uint8Array>) {
+				for await (const chunk of source) {
+					bytes += chunk.byteLength;
+					if (bytes > PDF_MAX_BYTES) throw new Error(`file is over the ${num(PDF_MAX_BYTES)}-byte cap`);
+					yield chunk;
+				}
+			},
+			createWriteStream(path),
+			{ signal: combined },
+		);
+		return path;
+	} catch (error) {
+		removeTemp(path);
+		throw error;
+	}
 }
 
-/** anymd → clean Markdown: structure, tables, OCR, transcripts. Preferred for documents. */
-async function execAnymd(path: string): Promise<string> {
+/** A failed converter's partial stdout is not trustworthy full text. */
+async function execAnymd(path: string, signal?: AbortSignal): Promise<string> {
+	signal?.throwIfAborted();
 	const text = await new Promise<string>((resolvePromise, reject) => {
-		execFile(ANYMD_BIN, [path], { maxBuffer: 32 * 1024 * 1024, timeout: 180_000, env: anymdEnv() }, (error, stdout, stderr) => {
-			if (error && !stdout) {
+		execFile(ANYMD_BIN, [path], { maxBuffer: 32 * 1024 * 1024, timeout: 180_000, env: anymdEnv(), signal }, (error, stdout, stderr) => {
+			if (error) {
+				if (signal?.aborted) { reject(signal.reason); return; }
 				const message = String(stderr || error.message).trim().split("\n")[0] ?? "";
 				const hint = /ENOENT/.test(String(error.message))
 					? "anymd not installed — run `npm i -g @sylphx/anymd`"
-					: `anymd failed: ${message.slice(0, 200)}`;
+					: `anymd failed: ${message.slice(0, 200)}${stdout ? " (incomplete output discarded)" : ""}`;
 				reject(new Error(hint));
 				return;
 			}
 			resolvePromise(stdout);
 		});
 	});
+	signal?.throwIfAborted();
 	const clean = text.replace(/\u0000/g, "").trim();
 	if (!clean) throw new Error("anymd produced no text (scanned file? try OCR)");
-	// A real PDF yields thousands of characters; a near-empty result means a broken
-	// download or an image-only page whose OCR failed, so let pdftotext take over.
-	if (clean.length < 400 && readFileSync(path).subarray(0, 5).toString("latin1") === "%PDF-")
-		throw new Error(`anymd extracted only ${clean.length} chars from this PDF`);
+	// Short notices and receipts can be valid PDFs. Length alone cannot prove failure.
 	return clean;
 }
 
-async function anymdToText(url: string, signal?: AbortSignal): Promise<Page> {
-	const path = await downloadToTemp(url, signal);
-	try {
-		return { url, title: basename(new URL(url).pathname) || url, content: await execAnymd(path), source: "anymd" };
-	} finally {
-		try {
-			unlinkSync(path);
-		} catch {
-			// temp file already gone
-		}
-	}
-}
-
-/** pdftotext: fast plain-text extraction, the fallback when anymd is missing or fails. */
-async function execPdftotext(path: string): Promise<string> {
+/** pdftotext is optional and only used after a genuine PDF conversion failure. */
+async function execPdftotext(path: string, signal?: AbortSignal): Promise<string> {
+	signal?.throwIfAborted();
 	const text = await new Promise<string>((resolvePromise, reject) => {
 		execFile(
 			"pdftotext",
 			["-layout", "-enc", "UTF-8", path, "-"],
-			{ maxBuffer: 64 * 1024 * 1024, timeout: 60_000 },
+			{ maxBuffer: 64 * 1024 * 1024, timeout: 60_000, signal },
 			(error, stdout) => {
-				if (error && !stdout) {
+				if (error) {
+					if (signal?.aborted) { reject(signal.reason); return; }
 					const hint = /ENOENT/.test(String(error.message))
-						? "pdftotext not found — run `brew install poppler`"
-						: `pdftotext failed: ${error.message}`;
+						? "pdftotext not found — install poppler"
+						: `pdftotext failed: ${error.message}${stdout ? " (incomplete output discarded)" : ""}`;
 					reject(new Error(hint));
 					return;
 				}
@@ -1593,38 +1682,46 @@ async function execPdftotext(path: string): Promise<string> {
 			},
 		);
 	});
+	signal?.throwIfAborted();
 	const clean = text.replace(/\u0000/g, "").trim();
-	if (!clean) throw new Error("pdftotext produced no text (scanned PDF? try mutool / OCR)");
+	if (!clean) throw new Error("pdftotext produced no text (scanned PDF? try OCR)");
 	return clean;
 }
 
-async function pdfToText(url: string, signal?: AbortSignal): Promise<Page> {
-	const temp = await downloadToTemp(url, signal);
-	try {
-		return { url, title: basename(new URL(url).pathname) || url, content: await execPdftotext(temp), source: "pdftotext" };
-	} finally {
+async function convertDocument(path: string, allowPdfFallback: boolean, signal?: AbortSignal): Promise<{ content: string; source: "anymd" | "pdftotext" }> {
+	const errors: string[] = [];
+	const attempts: Array<["anymd" | "pdftotext", () => Promise<string>]> = [["anymd", () => execAnymd(path, signal)]];
+	if (allowPdfFallback) attempts.push(["pdftotext", () => execPdftotext(path, signal)]);
+	for (const [source, run] of attempts) {
+		signal?.throwIfAborted();
 		try {
-			unlinkSync(temp);
-		} catch {
-			// temp file already gone
+			return { content: await run(), source };
+		} catch (error) {
+			signal?.throwIfAborted();
+			errors.push(`${source}: ${error instanceof Error ? error.message : String(error)}`);
 		}
+	}
+	throw new Error(`Cannot convert document\n  ${errors.join("\n  ")}`);
+}
+
+/** Reuse one download for both parsers, then always remove it. */
+async function anymdToText(url: string, signal?: AbortSignal, allowPdfFallback = true): Promise<Page> {
+	const path = await downloadToTemp(url, signal);
+	try {
+		const media = /\.(mp3|m4a|wav|flac|aac|mp4|mov|mkv|webm)$/i.test(new URL(url).pathname);
+		return { url, title: basename(new URL(url).pathname) || url, ...await convertDocument(path, allowPdfFallback, signal),
+			...(media ? { contentKind: "unknown" as const, note: "media metadata or existing subtitles; automatic transcription was not requested" } : {}) };
+	} finally {
+		removeTemp(path);
 	}
 }
 
-/** Local document: the same anymd → pdftotext ladder, minus the download. */
-async function localToText(path: string): Promise<Page> {
-	const title = basename(path);
-	const attempts: Array<[string, () => Promise<string>]> = [["anymd", () => execAnymd(path)]];
-	if (/\.pdf$/i.test(path)) attempts.push(["pdftotext", () => execPdftotext(path)]);
-	const errors: string[] = [];
-	for (const [name, run] of attempts) {
-		try {
-			return { url: path, title, content: await run(), source: name === "anymd" ? "anymd" : "pdftotext", note: "local file, never uploaded" };
-		} catch (error) {
-			errors.push(`${name}: ${error instanceof Error ? error.message : String(error)}`);
-		}
-	}
-	throw new Error(`Cannot read local file ${path}\n  ${errors.join("\n  ")}`);
+/** Local document: no download, no upload, and cancellation reaches the converter. */
+async function localToText(path: string, signal?: AbortSignal): Promise<Page> {
+	const media = /\.(mp3|m4a|wav|flac|aac|mp4|mov|mkv|webm)$/i.test(path);
+	return { url: path, title: basename(path), ...await convertDocument(path, /\.pdf$/i.test(path), signal),
+		...(media ? { contentKind: "unknown" as const } : {}),
+		note: `local file, never uploaded${media ? "; media metadata or existing subtitles; automatic transcription was not requested" : ""}` };
 }
 
 const getSearchContent = defineTool({
@@ -1646,7 +1743,7 @@ const getSearchContent = defineTool({
 		),
 		findMode: Type.Optional(Type.String({ description: "findText mode: exact|case-insensitive|fuzzy." })),
 	}),
-	async execute(_toolCallId, params) {
+	async execute(_toolCallId, params): Promise<{ content: Array<{ type: "text"; text: string }>; details: Record<string, unknown> }> {
 		const stored = loadStored(params.responseId);
 		if (!stored) throw new Error(`Unknown or expired responseId: ${params.responseId} (cache keeps 7 days)`);
 
@@ -1662,13 +1759,13 @@ const getSearchContent = defineTool({
 					entries.push({
 						label: `query#${qIndex} "${query.query}" · result ${hIndex + 1}`,
 						text: hit.content || hit.snippet || "",
-						meta: [hit.title, hit.url, query.provider],
+						meta: [hit.title, hit.url, query.provider, hit.contentKind ?? "unknown"],
 					});
 				}
 			}
 		} else {
 			for (const [index, page] of stored.pages.entries()) {
-				entries.push({ label: `page ${index + 1}`, text: page.content, meta: [page.title, page.url, page.source] });
+				entries.push({ label: `page ${index + 1}`, text: page.content, meta: [page.title, page.url, page.source, page.contentKind ?? "extracted", page.note ?? ""] });
 			}
 		}
 		if (entries.length === 0) throw new Error(`${stored.id} has no stored text`);
@@ -1795,7 +1892,7 @@ export default function (pi: ExtensionAPI) {
 					`engines: deepseek ${ds} · exa ${exa}`,
 					"routing: auto → DeepSeek; exa for 公众号/小红书/YouTube/V2EX or on failure / 0 results / >128-char queries",
 					`deepseek: search timeout ${DS_SEARCH_TIMEOUT_MS / 1000}s · fetch timeout ${fetchTimeoutMs() / 1000}s · fetch gap ${fetchGapMs()}ms`,
-					`ocr shim: ${ANYMD_SHIM && existsSync(ANYMD_SHIM) ? ANYMD_SHIM : "not found (English-only OCR, set ANYMD_SHIM_DIR)"}`,
+					`ocr shim: ${ANYMD_SHIM && existsSync(ANYMD_SHIM) ? ANYMD_SHIM : "not configured; OCR depends on anymd setup"}`,
 					`cache: ${files} file(s), ${(bytes / 1024 / 1024).toFixed(1)} MB (keep ${CACHE_KEEP_DAYS}d / ${CACHE_KEEP_FILES} files / 64 MB)`,
 					`config: ${join(agentDir(), "web-search.json")}`,
 				].join("\n"),
@@ -1804,3 +1901,11 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 }
+
+// Pure/internal seams for deterministic offline tests; these do not register additional tools.
+export const __test = {
+	trimToLimit, composeDeepSeekQuery, urlKey, normalizeHits, rememberHits, rememberPage, hotLookup,
+	hotCache, fetchOne, requestJson, requestBudget, retryDelay, hostStates, targetStarts, paced,
+	execAnymd, execPdftotext, downloadToTemp, anymdToText, localToText, convertDocument, anymdEnv,
+	renderHits, saveStored, loadStored, pruneCache, squeezeHits, indexSubstitute,
+};

@@ -30,7 +30,7 @@ fi
 
 for arg in "$@"; do
   case "$arg" in
-    -l|--oem|--psm) exec "$TESSERACT_BIN" "$@" ;;
+    -l) exec "$TESSERACT_BIN" "$@" ;;
   esac
 done
 exec "$TESSERACT_BIN" -l "${ANYMD_TESS_LANGS:-chi_sim+eng}" "$@"

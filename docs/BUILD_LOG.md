@@ -1,39 +1,39 @@
-# How I Built pi-deepread: From a Single Tweet to a 1,300-Line Extension
+# How I Built pi-deepread: From a Single Tweet to a Single-File Extension
 
 English | [简体中文](BUILD_LOG_zh-CN.md)
 
-> This isn't a tutorial. It's a candid log of what I wanted to build, what I guessed wrong, and why the extension ended up the way it is. Most of the code was written with AI assistance; the requirements, debugging, tradeoffs, and verification were mine. All numbers are measured on my local machine.
+> This isn't a tutorial. It's an honest diary of what I set out to build, where my assumptions fell flat, and why the extension ended up the way it is. Most of the code was written with AI assistance; the requirements, debugging, tradeoffs, and verification were mine. All numbers were measured directly on my machine.
 
 ---
 
 ## The Spark: Why Make Two Requests When Search Can Return Full Text?
 
-It started with [@Arcadia_Bao's post](https://x.com/Arcadia_Bao/article/2111711040757006401) benchmarking DeepSeek's Search and Fetch APIs. One observation immediately stood out:
+It started when I came across [@Arcadia_Bao's post](https://x.com/Arcadia_Bao/article/2111711040757006401) benchmarking DeepSeek's Search and Fetch APIs. One observation immediately jumped out at me:
 
 > You should always turn on `need_content: true`. There is no extra charge—it still costs ¥0.005 per query.
 
-That means a single search request returns not just titles and snippets, but the **full extracted page text** for every hit. In actual tests, that was 3.7k to 12.6k characters per result, and nearly 30,000 characters for an arXiv page.
+That meant a single search request could return not just titles and snippets, but the **full extracted page text** for every hit. In actual tests, that meant 3.7k to 12.6k characters per result, and nearly 30,000 characters for an arXiv page.
 
-At the time, I was using `pi-web-access`. Its workflow followed the classic "search snippet, then fetch" pattern: search returns a few 800-character snippets, the model decides it doesn't have enough context, and it makes another tool call to fetch the page. Two network roundtrips, double the latency. If search could hand back the full page right away, most "search-then-fetch" roundtrips wouldn't need to happen at all.
+At the time, my daily driver was `pi-web-access`. Its workflow followed the classic "search snippet, then fetch" dance: a search returns a handful of 800-character snippets, the model decides it doesn't have enough context, and it makes another tool call to fetch the page. Two network roundtrips, double the latency. If search could hand back the full page on round one, most "search-then-fetch" roundtrips wouldn't need to happen at all.
 
-Existing extensions didn't enable that flag. So I decided to build one.
+Existing extensions didn't enable that flag. So I decided to build my own.
 
 ---
 
-## Hitting a Wall on Day One: TUN Proxies and Fake-IP Collisions
+## Day One: Slamming Straight into the TUN Proxy Wall
 
-I wrote a quick prototype, ran a fetch test, and immediately got slapped with a red error:
+I threw together a quick prototype, ran a fetch test, and was immediately slapped in the face with a bright red error in my terminal:
 
 ```text
 Error: Blocked internal address for x.com: 198.18.0.14.
 This address is in 198.18.0.0/15, commonly used by TUN/fake-IP proxies.
 ```
 
-My first reaction was that my SSRF validation logic was broken. How on earth could `x.com` be an internal address?
+My first reaction was that my SSRF validation logic was completely broken. How on earth could `x.com` count as an internal private IP address?
 
-Then I checked my network setup. I run a TUN-mode proxy (Clash/Surge). To handle transparent routing, the proxy intercepts DNS queries and hands out fake IPs from the reserved `198.18.0.0/15` pool; actual traffic is routed by domain name under the hood. Meanwhile, the extension blocks reserved subnets to stop rogue web pages from tricking the agent into querying cloud metadata (like `169.254.169.254`) or local services. `198.18.0.0/15` was right in the blacklist.
+Then the penny dropped: my machine runs a TUN-mode proxy (Clash/Surge). In transparent fake-IP mode, DNS queries are intercepted and mapped to the reserved `198.18.0.0/15` pool; actual routing happens under the hood by domain name. Meanwhile, to stop rogue web pages from tricking the agent into querying cloud metadata (like `169.254.169.254`) or local network services, my extension blocked all reserved subnets. `198.18.0.0/15` was caught right in the crosshairs.
 
-The fix was straightforward—adding an opt-in config:
+The fix was a simple opt-in config:
 
 ```json
 {
@@ -43,23 +43,28 @@ The fix was straightforward—adding an opt-in config:
 }
 ```
 
-The tradeoff here is important: adding this line tells the tool "trust this subnet to be handled by the proxy." Behind a TUN proxy, that's safe. But if you move off that proxy, that exemption becomes an actual hole. That's why it is strictly opt-in and will never be a default setting.
+The tradeoff here is worth being candid about: adding this line tells the tool "trust this subnet to be handled by the proxy." In a TUN setup, that's completely safe. But if you take your laptop off that proxy, that exception becomes a real opening. That's why it is strictly opt-in and will never be enabled by default.
 
 ---
 
-## Probing with curl: What the Docs Didn't Tell Me
+## Probing with curl: What the Docs Never Mentioned
 
-After fixing the proxy config, I tried fetching the original tweet. `x.com` returned an `HTTP 403`. I tried routing it through `r.jina.ai`, and ran straight into Jina's domain block:
+With the proxy config sorted out, I tried fetching the original tweet. `x.com` promptly returned an `HTTP 403`. So I tried passing it through `r.jina.ai`, and ran smack into Jina's abuse blacklist:
 
 ```json
 {"code":403,"name":"AbuseAlleviationError","message":"Anonymous access to domain x.com blocked until Sun Oct 18 2026..."}
 ```
 
-In the end, I had to ask a friend to copy-paste the text for me.
+I ended up having to ask a friend to copy-paste the text of the tweet for me in a DM.
 
-That failure was a good reminder: fetching failures fall into three distinct tiers—network issues (timeouts, 429s), target site blocks (403s, paywalls, login walls), and third-party proxy blocks (Jina's own blacklists). It's easy to waste hours debugging local code when the problem is actually at the third tier.
+That little detour was a good wake-up call: web fetch failures generally happen at three different layers:
+1. **Network layer** (timeouts, 429 rate limits).
+2. **Target site layer** (403 forbidden, paywalls, login screens).
+3. **Proxy layer** (quotas and domain blacklists on public proxies like Jina).
 
-Before writing more extension code, I decided to test DeepSeek's raw API directly using curl. That turned out to be the best decision of the project:
+The third layer is the most frustrating, because it easily tricks you into second-guessing your own local code when your code is completely innocent.
+
+To avoid running into more unseen landmines, I decided to stop writing extension code and test DeepSeek's raw API endpoints with plain `curl`. That turned out to be the smartest call I made:
 
 ### 1. `need_content` is off by default
 
@@ -77,33 +82,33 @@ content_len = 3739 / 12614
 authority = 3, rerank_score ≈ 2.19
 ```
 
-Each hit suddenly comes with thousands of characters of extracted text. If I had jumped straight into writing the extension without curling first, searches would have returned titles and URLs, everything would look like it worked, but the agent would receive only short summaries. I would have spent days wondering why DeepSeek wasn't returning full text.
+Each hit suddenly comes with thousands of characters of extracted text. If I hadn't verified this with curl first, searches would have returned titles and URLs, everything would look functional on the surface, but the agent would secretly receive only short summaries. I would have spent days wondering why DeepSeek wasn't returning full text.
 
-DeepSeek also provides two native fields in the response: `authority` (0–4, ≥3 is authoritative) and `rerank_score` (0–3, ≥1.5 is high quality). They come directly from the API, so there is no need to compute ranking scores locally.
+DeepSeek also provides two native fields in the response: `authority` (0–4, ≥3 is authoritative) and `rerank_score` (0–3, ≥1.5 is high quality). They come directly from the API, so there is no need to invent local ranking heuristics.
 
 ### 2. The 128-character hard cap and query operators
 
-I initially thought it would be neat to compile `domainFilter` and `recencyFilter` into `site:` and `after:` operators inside the search `query`. It saved an extra parameter and felt clean. Then a slightly detailed query blew up:
+I initially thought I was being clever by compiling `domainFilter` and `recencyFilter` into `site:` and `after:` operators right inside the query string. It felt cleaner than managing extra parameters. Then a slightly wordy query blew up:
 
 ```text
 HTTP 400 {"error":{"message":"'query' must be at most 128 characters (request_id: ...)"}}
 ```
 
-DeepSeek measures the total character length of the final query string after operators are appended. Operators eat directly into that 128-character limit.
+Turns out DeepSeek measures the length of the *final compiled query string*. Filter operators eat directly into that 128-character limit.
 
-The solution: measure the query length after compilation. If it exceeds 128 characters and an Exa key is configured, hand the entire query to Exa (which doesn't have this limit). If no Exa key is set, fail immediately, but include the compiled query string directly in the error message.
+The fix: measure the query length after compilation. If it exceeds 128 characters and an Exa key is configured, hand the entire query to Exa (which doesn't have this limit). If no Exa key is set, fail immediately—but include the full compiled query string directly in the error message so you can see right away what caused it to spill over.
 
-Putting the full context into the error message saved me countless hours—you see right away what caused the query to spill over.
+Putting the full context into error messages saved me countless hours of head-scratching.
 
 ### 3. Concurrency: 10 threads trigger 429s, 3 threads run clean
 
-My benchmarks showed that at 10 concurrent requests, roughly 30% of calls returned `HTTP 429` within 0.6 seconds.
+At 10 concurrent requests, roughly 30% of calls got slapped with `HTTP 429` within 600ms.
 
-Even though 429 responses aren't billed, the backoff-and-retry penalty kills user responsiveness.
+Even though 429 responses aren't billed, the exponential backoff penalty kills responsiveness.
 
-My first version ran purely serially with a 900ms delay between requests. It was bulletproof, but fetching 4 URLs took nearly 6 seconds, mostly spent waiting on timers.
+My first version ran purely sequentially with a 900ms delay between requests. It was rock-solid, but fetching 4 URLs took nearly 6 seconds—most of it spent staring at sleep timers.
 
-The final setup uses **3 concurrency slots with a staggered launch delay of gap/3 (300ms)**:
+The sweet spot was **3 concurrency slots with a staggered launch delay of gap/3 (300ms)**:
 - At most 3 requests in flight at once (well below the rate-limit threshold).
 - New requests are staggered 300ms apart.
 
@@ -111,50 +116,52 @@ Fetching 4 URLs dropped from 5.71 seconds to **2.85 seconds**, with zero 429s.
 
 ---
 
-## The Temptation: Why Not Just Patch Someone Else's Bundle?
+## The Temptation: Why Not Just Patch Someone Else's Minified Code?
 
-While inspecting `pi-web-access`, I found where DeepSeek search results were being sliced:
+While inspecting `pi-web-access`, I found the culprit line where DeepSeek search results were being sliced:
 
 ```javascript
 snippet: (text4(entry.summary) || text4(entry.snippet)).slice(0, MAX_SNIPPET_CHARS4)
 // MAX_SNIPPET_CHARS4 = 800
 ```
 
-And `need_content` was nowhere in the request body (`grep -c need_content dist/index.js` returned 0). Upstream issue #582 was open with no activity.
+And `need_content` was nowhere in the request body (`grep -c need_content dist/index.js` returned 0). Upstream issue #582 had been sitting open with no activity.
 
-I briefly considered patching the installed bundle: replace 800 with 8000. `node --check` passed, and it worked. But thinking it through made me stop:
+I was genuinely tempted to take the quick way out: open the installed bundle, change 800 to 8000, and call it a day. I tested it with `node --check`, and it actually worked!
 
-1. The next package update would wipe the patch immediately.
-2. Hacking a 1MB minified bundle is a maintenance nightmare whenever something breaks.
-3. More importantly, my goal wasn't just increasing a snippet cap from 800 to 8000. I wanted responses saved to disk, pagination, and a way to jump straight to passages with `findText`.
+Then common sense kicked in:
 
-So I chose to write a fresh extension: 1,300 lines of TypeScript, a single file, and zero runtime dependencies. Looking back, that was the best call I made.
+1. The next package update would wipe my patch immediately.
+2. Hacking a 1MB minified bundle is pure agony the moment something breaks.
+3. Most importantly, my real goal wasn't just inflating a snippet size from 800 to 8,000 characters. I wanted search results cached on disk by `responseId`, clean pagination, and a `findText` tool so the model could jump straight to relevant sections without blowing its context window.
+
+So I chose to write a clean extension from scratch: 1,300 lines of TypeScript, a single file, and zero runtime dependencies. Looking back, that was definitely the right move.
 
 ---
 
 ## Local Document Parsing: anymd and the Second SSRF Trap
 
-Web pages can be fetched through DeepSeek, but what if a user asks to read a local PDF, DOCX, spreadsheet, EPUB, image, or audio recording? I didn't want sensitive local files sent to external APIs. Everything had to be converted locally.
+Web pages can be fetched through DeepSeek, but what if a user asks Pi to read a local PDF, Word doc, spreadsheet, EPUB, image, or audio recording? I was adamant about one thing: sensitive local files should never be uploaded to external APIs. Everything had to be processed 100% on the user's machine.
 
-I picked [anymd](https://github.com/SylphxAI/anymd). It converts a wide variety of formats into clean Markdown. It supports URLs directly, so I tried passing web URLs straight to it to avoid a separate download step:
+I picked [anymd](https://github.com/SylphxAI/anymd). It converts a wide variety of formats into clean Markdown. It even supports URLs directly, so I initially tried passing web URLs straight to it to avoid a separate download step:
 
 ```text
 anymd: https://arxiv.org/pdf/1706.03762: URL host 'arxiv.org' resolves to a non-public address (SSRF protection).
 ```
 
-Same root cause: the TUN proxy resolved `arxiv.org` to `198.18.7.138`. But unlike my code, anymd is a precompiled Rust binary. Searching its strings showed no flags or environment variables to disable its SSRF checks.
+The exact same TUN proxy issue, round two! But unlike my own code, `anymd` is a precompiled Rust binary. Searching its strings confirmed there were no configuration flags or environment variables to disable its internal SSRF checks.
 
-The fix: **always download to a local temporary file first, then pass the file path to anymd**. This bypasses anymd's SSRF checks, lets me enforce a 30MB file size cap, and ensures temp files get cleaned up automatically.
+The solution: **always download the file to a temporary local file first, then pass the file path to anymd**. This neatly sidesteps `anymd`'s SSRF checks, lets me enforce a hard 30MB file size limit, and guarantees temp files get cleaned up automatically.
 
-There was a memory trap here, too: my first pass used `arrayBuffer()` to read 30MB into memory before writing to disk. With 3 concurrent downloads, memory spiked to 90MB. Switching to Node.js stream pipelines dropped peak memory down to tens of kilobytes.
+There was a sneaky memory gotcha here too: my first version used `arrayBuffer()` to read 30MB into memory before writing to disk. With 3 concurrent downloads, memory spiked by 90MB. Switching to Node.js stream pipelines flattened peak memory usage down to a few kilobytes.
 
 ---
 
 ## Chinese Scanned PDFs: A 12-Line Shell Shim
 
-Once files parsed properly, Chinese OCR broke. anymd invokes tesseract via `tesseract <image> stdout` without a `-l` flag, which defaults to English. Scanned Chinese documents came out as strings of nonsensical Latin characters.
+Once file parsing was working, Chinese OCR fell apart. `anymd` calls Tesseract via `tesseract <image> stdout` without a `-l` flag, which defaults to English. Scanned Chinese documents came out as lines of garbled Latin letters.
 
-Instead of forking anymd and recompiling Rust, I wrote a 12-line shell shim and placed it ahead of system binaries in `PATH`:
+Forking `anymd` and compiling Rust felt like massive overkill for what amounted to missing CLI flags. Instead, I wrote a 12-line shell wrapper and placed it in front of system binaries in `PATH`:
 
 ```bash
 #!/bin/bash
@@ -167,13 +174,13 @@ done
 exec "$REAL" -l "${ANYMD_TESS_LANGS:-chi_sim+eng}" "$@"
 ```
 
-If the caller specifies a language flag, the shim forwards the call untouched. If not, it injects `-l chi_sim+eng`. The shim ships in `bin/tesseract` with this package—install `tesseract-lang`, and Chinese OCR works out of the box.
+If the caller passes any language or mode flags, the shim steps aside and forwards the call untouched. If not, it injects `-l chi_sim+eng`. The shim lives in `bin/tesseract` in this repository—install `tesseract-lang`, and Chinese OCR works without touching anything else.
 
 ---
 
 ## Benchmarking: Is Structured Markdown Actually Worth It?
 
-To verify that anymd wasn't just unnecessary complexity, I ran benchmarks on two papers: the 15-page *Attention Is All You Need* and the 75-page *GPT-3* paper:
+To make sure `anymd` wasn't just vanity complexity, I ran benchmarks on two papers: the 15-page *Attention Is All You Need* and the 75-page *GPT-3* paper:
 
 | Tool | Chars Extracted | Headings | Table Rows | Hyphenation Errors | Bad Glyphs | Time |
 |---|---|---|---|---|---|---|
@@ -182,84 +189,84 @@ To verify that anymd wasn't just unnecessary complexity, I ran benchmarks on two
 | pdftotext (raw) | 39,919 | 0 | 0 | 0 | 15 | 0.11s |
 | mutool -F txt | 40,067 | 0 | 0 | 16 | 16 | 0.14s |
 
-The results showed that **their failure modes are completely different**:
+The numbers revealed something crucial: **their failure modes are completely different**.
 
-- Traditional tools output an unstructured text stream. On dual-column papers, sentences from left and right columns frequently interleave, and over 60% of lines are broken short fragments. Models struggle to read this.
-- anymd preserves document structure: clean heading hierarchies (`## 3 Model Architecture` → `### 3.1 Encoder and Decoder Stacks`), tables formatted as Markdown pipe tables, and figures tagged with captions and page numbers.
-- The cost is a 2x slowdown (0.22s vs 0.09s) and occasional table column alignment glitches.
+- Traditional command-line tools dump an unstructured stream of text. On two-column academic papers, sentences from the left and right columns frequently interleave, and more than 60% of lines end up as broken, truncated fragments. An LLM trying to read that has to spend half its capacity unscrambling syntax.
+- `anymd` preserves the semantic hierarchy: clean heading structures (`## 3 Model Architecture` → `### 3.1 Encoder and Decoder Stacks`), tables formatted as clean Markdown pipe tables, and figures labeled with captions and page numbers.
+- The tradeoff is a 2x time penalty (0.22s vs 0.09s) and occasional column alignment quirks in complex tables. For an agent reading technical documents, that's a trade I'll make every day.
 
-Neither tool solves mathematical formulas: equations come out like `Attention(Q, K, V ) = softmax( √ )V (1) d_k`, where root symbols lose their placement. That is an inherent limitation of font glyph positioning in PDFs, not something a text converter can fix.
+Neither tool solves mathematical formulas: equations still turn into things like `Attention(Q, K, V ) = softmax( √ )V (1) d_k`, where square root symbols lose their placement. That's a fundamental limitation of how PDF font glyphs are positioned on a page, not something a text converter can magically repair.
 
 ---
 
-## Packaging and the `import.meta.url` Quirk
+## Packaging and the `import.meta.url` Surprise
 
-During local testing with a symlink in `~/.pi/agent/extensions/`, `import.meta.url` resolved the sibling `bin/tesseract` shim cleanly.
+During local development with a symlink in `~/.pi/agent/extensions/`, `import.meta.url` resolved the sibling `bin/tesseract` shim without a hitch.
 
-Once packaged for npm and run via `pi -e`, it suddenly failed:
+Once I packaged it for npm and tested it via `pi -e`, it suddenly threw an error:
 
 ```text
 [pi-deepread] shim:  exists: false
 ```
 
-Pi uses jiti to load extensions, which converts modules into CommonJS at runtime. In that environment, `import.meta` is an empty object.
+Turns out Pi uses `jiti` under the hood to load extensions, compiling modules into CommonJS at runtime. In that environment, `import.meta` is an empty object.
 
-The fix was a layered fallback: first check `import.meta.url` (ESM mode), then fall back to `eval("typeof __dirname === 'string' ? __dirname : ''")` (CJS mode). If both fail, silently skip injecting the shim.
+The fix was a layered fallback: check `import.meta.url` first (for ESM), fall back to `eval("typeof __dirname === 'string' ? __dirname : ''")` (for CJS), and if neither works, gracefully skip injecting the shim.
 
-**Graceful degradation should be silent.** Missing an optional OCR shim shouldn't crash the entire core search extension.
+**Graceful degradation should be silent.** Missing an optional OCR helper should never crash the core search functionality.
 
 ---
 
 ## Features I Intentionally Left Out
 
-A few features were considered early on, but cut after evaluating the tradeoffs:
+A few features looked attractive early on, but I cut them after weighing the maintenance cost:
 
-- **YouTube transcript scraping**: DeepSeek search results for YouTube frequently point to `music.youtube.com`, requiring specialized link-parsing gymnastics for minimal gain.
-- **Image search**: Rarely needed when using a coding assistant.
-- **gzip compression for cached responses**: Compressing saves ~70% disk space, but requires decompression logic on every read and adds latency. A plain-text LRU policy (7 days / 200 files / 64MB) keeps disk usage well within bounds without the complexity.
+- **YouTube transcript scraping**: DeepSeek search results for YouTube frequently resolve to `music.youtube.com`, requiring annoying URL normalization heuristics for very little payoff.
+- **Image search**: Almost never needed in an agent primarily focused on coding and documentation.
+- **gzip compression for cached responses**: Compressing saves ~70% disk space, but requires decompression overhead on every read and adds latency. A straightforward LRU cleanup policy (7 days / 200 files / 64MB) keeps disk usage in check without the added complexity.
 
-Two items that used to be on this list came back after measurement — see [Round 2](#round-2-what-the-second-round-of-measurements-overturned) below: the in-session URL cache and the flat concurrency ceiling of 3.
+Interestingly, two items that were originally cut came back after I actually started measuring things—see Round 2 below: the in-session URL cache and per-host concurrency.
 
 ---
 
-## Round 2: What the Second Round of Measurements Overturned
+## Round 2: What Happened When I Actually Measured Everything
 
-A month after release the extension had 273 downloads a month with no promotion. That was enough reason to stop adding features and start measuring the ones already there. I built `bench/` — a real-API harness that loads the actual extension through Pi's loader, so every number below is a measured call, not an estimate.
+A month after release, the extension was sitting at around 270 monthly downloads without any promotion. Knowing real people were relying on it gave me the kick I needed: stop adding new features, and actually measure what was already there. I built `bench/`—a real benchmark harness that loads the extension through Pi's actual runtime loader, so every single number below is a measured API call, not an estimate.
 
-Because the harness imports the extension exactly the way Pi does, it needs Pi's own `node_modules` on the path: `ln -s ~/.pi/agent/install/releases/<version>/node_modules node_modules`, then `node bench/prompt-surface.ts` or `node bench/scenarios.ts [p0|p1|p2]`. The symlink is local-only and not tracked.
+Because the harness imports the extension exactly the way Pi does, it needs Pi's own `node_modules` on the path: `ln -s ~/.pi/agent/install/releases/<version>/node_modules node_modules`, then `node bench/prompt-surface.ts` or `node bench/scenarios.ts [p0|p1|p2]`. (The symlink is local-only and not tracked in git.)
 
-| What | Before | After | Why it moved |
+| What | Before | After | Why it changed |
 | --- | --- | --- | --- |
-| Always-on prompt surface | 5,896 chars / 1,638 tok | 3,494 chars / 971 tok | Behaviour moved out of the system prompt into the tool output |
-| Paywalled pages that returned content | 0 of 6 | 5 of 6 | Reader proxy + Wayback fallback, raced in parallel |
-| A page that only renders in a browser | 12 s timeout, then failure | 2.8 s, 53 KB | The extractor was fine; the fetch was wrong |
-| arXiv `abs` page | 6,436 ms | 804 ms | Try the HTML `/html/` version first when it exists |
-| arXiv paper with no HTML version | 5,955 ms | 273 ms | Stop trying when the paper predates arXiv HTML |
-| Six concurrent fetches | 9,314 ms | 2,727 ms | Per-host scheduling instead of one global ceiling of 3 (waiting on the index fallback unconditionally would cost 31,900 ms) |
+| Always-on prompt surface | 5,896 chars / 1,638 tok | 3,494 chars / 971 tok | Behavior moved out of the system prompt and into tool outputs |
+| Paywalled pages returning content | 0 of 6 | 5 of 6 | Reader proxy and Wayback Machine raced in parallel |
+| Browser-only rendered page | 12 s timeout, then failure | 2.8 s, 53 KB | The extractor was fine; the fetch strategy was wrong |
+| arXiv abstract page | 6,436 ms | 804 ms | Fetch the HTML version (`/html/`) first when it exists |
+| arXiv paper with no HTML version | 5,955 ms | 273 ms | Stop trying HTML when the paper predates arXiv's HTML renderer |
+| Six concurrent fetches | 9,314 ms | 2,727 ms | Per-host scheduling instead of an arbitrary global ceiling of 3 |
 | Re-fetching the same URL | 7,042 ms | 1 ms | In-session hot cache |
-| Local PDF for the agent | Failed with "Blocked internal address" | 143 ms of extracted text | A path is a source, not a URL |
-| Wikipedia markdown | 105 KB with 4 junk lines | 100 KB with 1 | Chrome stripping scoped to `article`/`main` |
-| A 163-char query with filters | Hard error | 617 ms, results | Trim the query instead of failing it |
-| 5 hits × 6,000 chars | 3 of 5 hits carried text | 5 of 5 | Reserve a per-hit floor in the budget |
-| Duplicate sites in a 6-hit answer | 1–3 repeated hosts | 0–1, slot count unchanged | Over-fetch 2 extra, then drop duplicate URLs / 3rd hit per host / identical wire titles |
-| A JS shell as content | 123 chars of Weibo navigation | Recognised as a wall | "No long prose line + mostly chrome" is a better shape test than a keyword list |
+| Local PDF for the agent | Failed with "Blocked internal address" | 143 ms of extracted text | A file path is a local source, not a network URL |
+| Wikipedia markdown | 105 KB with 4 junk lines | 100 KB with 1 | Boilerplate stripping scoped to `<article>` and `<main>` |
+| 163-char query with filters | Hard error | 617 ms, results returned | Trim the query intelligently instead of failing the call |
+| 5 hits × 6,000 chars | 3 of 5 hits had text | 5 of 5 | Reserve a per-hit floor in the character budget |
+| Duplicate sites in 6-hit answer | 1–3 repeated hosts | 0–1, slot count unchanged | Over-fetch 2 extra results, then drop duplicate URLs, extra host hits, and wire copies |
+| JS shell disguised as content | 123 chars of Weibo navigation | Detected as a wall | "No long prose lines + mostly navigation" is far more reliable than keyword matching |
 
-Three lessons that were not in the original build log:
+Three lessons that weren't in the original build log:
 
-**The system prompt is the feature nobody benchmarks.** 1,638 tokens of always-on surface is paid on every single turn of every session, whether or not the model searches. Most of it was behaviour that only matters while a result is in front of the model — so it moved into the tool's own output, and the prompt kept only what changes a decision before the call. The companion rule: a tool description should say what the tool *is*, not how to be good at using it.
+**The system prompt is the invisible tax nobody benchmarks.** 1,638 tokens of prompt surface was being charged on every single turn of every conversation, whether the user searched the web or just asked "how do I exit vim." Most of those instructions only mattered *after* a search result was returned to the model. Moving that guidance into the tool's output brought the prompt footprint down to under 1,000 tokens (~3,500 characters). The rule: a tool description should describe what the tool *is*, not lecture the model on how to be a better user.
 
-**"Add a fallback" and "try again harder" are different designs.** The first version of the paywall handling added a second attempt after the first failed — which doubled the latency of every failure. Racing the tiers in parallel turned a 12-second timeout into a 2.8-second answer, with the same code.
+**"Add a fallback" and "try again harder" are totally different designs.** In my first pass at paywall handling, if the primary fetch failed, it tried a fallback—which effectively doubled latency on every broken page. Racing the reader proxy and the Wayback Machine in parallel turned a 12-second timeout into a 2.8-second answer, using the exact same code.
 
-**Guessed-wrong items deserve a headline, not a footnote.** The in-session cache was cut in v0.1 because "agents rarely fetch the same URL twice". They do — after a compaction, when re-reading a doc, when two hits share a host. And the flat concurrency of 3 was not the sweet spot: it serialized fetches to *different* hosts, which never rate-limited each other. Both are now in, and both are 1-2 orders of magnitude better than the version that "avoided the complexity".
+**The things you guessed wrong deserve a headline, not a footnote.** I cut the in-session cache in v0.1 because I assumed "agents rarely fetch the same URL twice." They do—after context compaction, when re-reading documentation, or when multiple search hits point to different sections of the same site. And my global concurrency cap of 3 was silly: it serialized fetches to *different* hosts that had no risk of rate-limiting each other. Both features are now in, and both gave 1–2 orders of magnitude improvements over the version that "avoided complexity."
 
 ---
 
-## Takeaways for Building Tool Extensions
+## Hard-Earned Rules of Thumb
 
-If you're building similar extensions for coding agents:
+If you're building tool extensions for coding agents:
 
-1. **Test with curl before writing code.** Don't trust assumptions or skimmed documentation. Verify real payloads, error responses, and defaults first.
-2. **Include full context in error messages.** If a query is too long, print the compiled query. If a fetch fails, print the URL and error tier. You will save 90% of your debugging time.
-3. **Core failures should shout; optional features should degrade silently.** If DeepSeek fails, make sure the user knows it fell back to Exa. If the OCR shim is missing, just report it in `/web-status`.
+1. **Probe with curl before writing code.** Don't rely on assumptions or documentation that might be outdated. Verify raw payloads, error responses, and default values first.
+2. **Include full context in error messages.** If a query is too long, print the compiled query. If a fetch fails, print the URL and the failure tier. You'll save hours of debugging.
+3. **Core failures should shout; optional features should degrade silently.** If DeepSeek fails, make sure the user knows it fell back to Exa. If the OCR shim is missing, just report it quietly in `/web-status`.
 4. **Never patch vendor bundles.**
-5. **Record numbers while you test.** Not for presentation slides, but so that three days later you have an objective baseline to know whether performance actually degraded.
+5. **Measure and record numbers as you build.** Not to show off in a README, but so that a week later you have an objective baseline to know whether your latest tweak actually helped or hurt.
